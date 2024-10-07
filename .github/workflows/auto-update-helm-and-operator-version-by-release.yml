@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Helm Charts Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: 'risingwavelabs/helm-charts'
           token: ${{ secrets.PR_TOKEN }}
@@ -47,12 +47,13 @@ jobs:
           path: 'helm-charts'
           reviewers: arkbriar
           delete-branch: true
+          signoff: true
 
   update-risingwave-operator:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Risingwave Operator Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: 'risingwavelabs/risingwave-operator'
           token: ${{ secrets.PR_TOKEN }}
@@ -75,3 +76,4 @@ jobs:
           path: 'risingwave-operator'
           reviewers: arkbriar
           delete-branch: true
+          signoff: true

@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::Duration;
 
@@ -38,13 +37,15 @@ use crate::deserialize_duration_from_string;
 use crate::error::ConnectorResult;
 use crate::sink::SinkError;
 use crate::source::nats::source::NatsOffset;
-// The file describes the common abstractions for each connector and can be used in both source and
-// sink.
 
 pub const PRIVATE_LINK_BROKER_REWRITE_MAP_KEY: &str = "broker.rewrite.endpoints";
 pub const PRIVATE_LINK_TARGETS_KEY: &str = "privatelink.targets";
 
 const AWS_MSK_IAM_AUTH: &str = "AWS_MSK_IAM";
+
+/// The environment variable to disable using default credential from environment.
+/// It's recommended to set this variable to `false` in cloud hosting environment.
+const DISABLE_DEFAULT_CREDENTIAL: &str = "DISABLE_DEFAULT_CREDENTIAL";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AwsPrivateLinkItem {
@@ -57,20 +58,33 @@ use aws_config::sts::AssumeRoleProvider;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_types::region::Region;
 use aws_types::SdkConfig;
+use risingwave_common::util::env_var::env_var_is_true;
 
 /// A flatten config map for aws auth.
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct AwsAuthProps {
+    #[serde(rename = "aws.region", alias = "region")]
     pub region: Option<String>,
-    #[serde(alias = "endpoint_url")]
+
+    #[serde(
+        rename = "aws.endpoint_url",
+        alias = "endpoint_url",
+        alias = "endpoint"
+    )]
     pub endpoint: Option<String>,
+    #[serde(rename = "aws.credentials.access_key_id", alias = "access_key")]
     pub access_key: Option<String>,
+    #[serde(rename = "aws.credentials.secret_access_key", alias = "secret_key")]
     pub secret_key: Option<String>,
+    #[serde(rename = "aws.credentials.session_token", alias = "session_token")]
     pub session_token: Option<String>,
     /// IAM role
+    #[serde(rename = "aws.credentials.role.arn", alias = "arn")]
     pub arn: Option<String>,
     /// external ID in IAM role trust policy
+    #[serde(rename = "aws.credentials.role.external_id", alias = "external_id")]
     pub external_id: Option<String>,
+    #[serde(rename = "aws.profile", alias = "profile")]
     pub profile: Option<String>,
 }
 
@@ -92,7 +106,7 @@ impl AwsAuthProps {
         }
     }
 
-    fn build_credential_provider(&self) -> ConnectorResult<SharedCredentialsProvider> {
+    async fn build_credential_provider(&self) -> ConnectorResult<SharedCredentialsProvider> {
         if self.access_key.is_some() && self.secret_key.is_some() {
             Ok(SharedCredentialsProvider::new(
                 aws_credential_types::Credentials::from_keys(
@@ -100,6 +114,10 @@ impl AwsAuthProps {
                     self.secret_key.as_ref().unwrap(),
                     self.session_token.clone(),
                 ),
+            ))
+        } else if !env_var_is_true(DISABLE_DEFAULT_CREDENTIAL) {
+            Ok(SharedCredentialsProvider::new(
+                aws_config::default_provider::credentials::default_provider().await,
             ))
         } else {
             bail!("Both \"access_key\" and \"secret_key\" are required.")
@@ -128,7 +146,7 @@ impl AwsAuthProps {
     pub async fn build_config(&self) -> ConnectorResult<SdkConfig> {
         let region = self.build_region().await?;
         let credentials_provider = self
-            .with_role_provider(self.build_credential_provider()?)
+            .with_role_provider(self.build_credential_provider().await?)
             .await?;
         let mut config_loader = aws_config::from_env()
             .region(region)
@@ -171,13 +189,25 @@ pub struct KafkaCommon {
     #[serde(rename = "properties.ssl.ca.location")]
     ssl_ca_location: Option<String>,
 
+    /// CA certificate string (PEM format) for verifying the broker's key.
+    #[serde(rename = "properties.ssl.ca.pem")]
+    ssl_ca_pem: Option<String>,
+
     /// Path to client's certificate file (PEM).
     #[serde(rename = "properties.ssl.certificate.location")]
     ssl_certificate_location: Option<String>,
 
+    /// Client's public key string (PEM format) used for authentication.
+    #[serde(rename = "properties.ssl.certificate.pem")]
+    ssl_certificate_pem: Option<String>,
+
     /// Path to client's private key file (PEM).
     #[serde(rename = "properties.ssl.key.location")]
     ssl_key_location: Option<String>,
+
+    /// Client's private key string (PEM format) used for authentication.
+    #[serde(rename = "properties.ssl.key.pem")]
+    ssl_key_pem: Option<String>,
 
     /// Passphrase of client's private key.
     #[serde(rename = "properties.ssl.key.password")]
@@ -226,7 +256,7 @@ pub struct KafkaPrivateLinkCommon {
     /// This is generated from `private_link_targets` and `private_link_endpoint` in frontend, instead of given by users.
     #[serde(rename = "broker.rewrite.endpoints")]
     #[serde_as(as = "Option<JsonString>")]
-    pub broker_rewrite_map: Option<HashMap<String, String>>,
+    pub broker_rewrite_map: Option<BTreeMap<String, String>>,
 }
 
 const fn default_kafka_sync_call_timeout() -> Duration {
@@ -304,11 +334,20 @@ impl KafkaCommon {
         if let Some(ssl_ca_location) = self.ssl_ca_location.as_ref() {
             config.set("ssl.ca.location", ssl_ca_location);
         }
+        if let Some(ssl_ca_pem) = self.ssl_ca_pem.as_ref() {
+            config.set("ssl.ca.pem", ssl_ca_pem);
+        }
         if let Some(ssl_certificate_location) = self.ssl_certificate_location.as_ref() {
             config.set("ssl.certificate.location", ssl_certificate_location);
         }
+        if let Some(ssl_certificate_pem) = self.ssl_certificate_pem.as_ref() {
+            config.set("ssl.certificate.pem", ssl_certificate_pem);
+        }
         if let Some(ssl_key_location) = self.ssl_key_location.as_ref() {
             config.set("ssl.key.location", ssl_key_location);
+        }
+        if let Some(ssl_key_pem) = self.ssl_key_pem.as_ref() {
+            config.set("ssl.key.pem", ssl_key_pem);
         }
         if let Some(ssl_key_password) = self.ssl_key_password.as_ref() {
             config.set("ssl.key.password", ssl_key_password);
@@ -521,13 +560,6 @@ impl KinesisCommon {
         Ok(KinesisClient::from_conf(builder.build()))
     }
 }
-#[derive(Debug, Deserialize)]
-pub struct UpsertMessage<'a> {
-    #[serde(borrow)]
-    pub primary_key: Cow<'a, [u8]>,
-    #[serde(borrow)]
-    pub record: Cow<'a, [u8]>,
-}
 
 #[serde_as]
 #[derive(Deserialize, Debug, Clone, WithOptions)]
@@ -589,7 +621,7 @@ impl NatsCommon {
             }
             "plain" => {}
             _ => {
-                bail!("nats connect mode only accept user_and_password/credential/plain");
+                bail!("nats connect mode only accepts user_and_password/credential/plain");
             }
         };
 
@@ -618,6 +650,7 @@ impl NatsCommon {
         stream: String,
         split_id: String,
         start_sequence: NatsOffset,
+        mut config: jetstream::consumer::pull::Config,
     ) -> ConnectorResult<
         async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
     > {
@@ -628,14 +661,10 @@ impl NatsCommon {
             .replace(',', "-")
             .replace(['.', '>', '*', ' ', '\t'], "_");
         let name = format!("risingwave-consumer-{}-{}", subject_name, split_id);
-        let mut config = jetstream::consumer::pull::Config {
-            ack_policy: jetstream::consumer::AckPolicy::None,
-            ..Default::default()
-        };
 
         let deliver_policy = match start_sequence {
             NatsOffset::Earliest => DeliverPolicy::All,
-            NatsOffset::Latest => DeliverPolicy::Last,
+            NatsOffset::Latest => DeliverPolicy::New,
             NatsOffset::SequenceNumber(v) => {
                 let parsed = v
                     .parse::<u64>()
@@ -645,11 +674,12 @@ impl NatsCommon {
                 }
             }
             NatsOffset::Timestamp(v) => DeliverPolicy::ByStartTime {
-                start_time: OffsetDateTime::from_unix_timestamp_nanos(v * 1_000_000)
+                start_time: OffsetDateTime::from_unix_timestamp_nanos(v as i128 * 1_000_000)
                     .context("invalid timestamp for nats offset")?,
             },
             NatsOffset::None => DeliverPolicy::All,
         };
+
         let consumer = stream
             .get_or_create_consumer(&name, {
                 config.deliver_policy = deliver_policy;
@@ -731,4 +761,25 @@ pub(crate) fn load_private_key(
         .next()
         .ok_or_else(|| anyhow!("No private key found"))?;
     Ok(cert?.into())
+}
+
+#[serde_as]
+#[derive(Deserialize, Debug, Clone, WithOptions)]
+pub struct MongodbCommon {
+    /// The URL of MongoDB
+    #[serde(rename = "mongodb.url")]
+    pub connect_uri: String,
+    /// The collection name where data should be written to or read from. For sinks, the format is
+    /// `db_name.collection_name`. Data can also be written to dynamic collections, see `collection.name.field`
+    /// for more information.
+    #[serde(rename = "collection.name")]
+    pub collection_name: String,
+}
+
+impl MongodbCommon {
+    pub(crate) async fn build_client(&self) -> ConnectorResult<mongodb::Client> {
+        let client = mongodb::Client::with_uri_str(&self.connect_uri).await?;
+
+        Ok(client)
+    }
 }

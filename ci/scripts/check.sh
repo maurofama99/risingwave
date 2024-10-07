@@ -17,6 +17,9 @@ done
 
 source ci/scripts/common.sh
 
+echo "--- Set openssl static link env vars"
+configure_static_openssl
+
 echo "--- Run trailing spaces check"
 scripts/check/check-trailing-spaces.sh
 

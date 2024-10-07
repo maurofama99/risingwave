@@ -19,7 +19,7 @@ mod utils;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::iter;
-use std::option::Option::Some;
+use std::mem::take;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -31,26 +31,30 @@ use risingwave_common::catalog::{
     DEFAULT_SCHEMA_NAME, DEFAULT_SUPER_USER, DEFAULT_SUPER_USER_FOR_PG,
     DEFAULT_SUPER_USER_FOR_PG_ID, DEFAULT_SUPER_USER_ID, SYSTEM_SCHEMAS,
 };
+use risingwave_common::secret::LocalSecretManager;
 use risingwave_common::{bail, current_cluster_version, ensure};
+use risingwave_connector::source::cdc::build_cdc_table_id;
 use risingwave_connector::source::{should_copy_to_format_encode_options, UPSTREAM_SOURCE_KEY};
 use risingwave_pb::catalog::subscription::PbSubscriptionState;
 use risingwave_pb::catalog::table::{OptionalAssociatedSourceId, TableType};
 use risingwave_pb::catalog::{
     Comment, Connection, CreateType, Database, Function, Index, PbSource, PbStreamJobStatus,
-    Schema, Sink, Source, StreamJobStatus, Subscription, Table, View,
+    Schema, Secret, Sink, Source, StreamJobStatus, Subscription, Table, View,
 };
-use risingwave_pb::ddl_service::{alter_owner_request, alter_set_schema_request};
+use risingwave_pb::ddl_service::{alter_owner_request, alter_set_schema_request, TableJobType};
 use risingwave_pb::meta::subscribe_response::{Info, Operation};
 use risingwave_pb::user::grant_privilege::{Action, ActionWithGrantOption, Object};
 use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::{GrantPrivilege, UserInfo};
+use tokio::sync::oneshot::Sender;
 use tokio::sync::{Mutex, MutexGuard};
 use user::*;
 
+pub use self::utils::{get_refed_secret_ids_from_sink, get_refed_secret_ids_from_source};
 use crate::manager::{
     IdCategory, MetaSrvEnv, NotificationVersion, StreamingJob, IGNORED_NOTIFICATION_VERSION,
 };
-use crate::model::{BTreeMapTransaction, MetadataModel, TableFragments, ValTransaction};
+use crate::model::{BTreeMapTransaction, MetadataModel, TableFragments};
 use crate::storage::Transaction;
 use crate::{MetaError, MetaResult};
 
@@ -64,6 +68,7 @@ pub type RelationId = u32;
 pub type IndexId = u32;
 pub type ViewId = u32;
 pub type FunctionId = u32;
+pub type SecretId = u32;
 
 pub type UserId = u32;
 pub type ConnectionId = u32;
@@ -84,6 +89,7 @@ macro_rules! commit_meta_with_trx {
         {
             use tracing::Instrument;
             use $crate::storage::meta_store::MetaStore;
+            use $crate::model::{InMemValTransaction, ValTransaction};
             async {
                 // Apply the change in `ValTransaction` to trx
                 $(
@@ -127,9 +133,14 @@ use risingwave_pb::meta::relation::RelationInfo;
 use risingwave_pb::meta::{Relation, RelationGroup};
 pub(crate) use {commit_meta, commit_meta_with_trx};
 
+use self::utils::{
+    refcnt_dec_sink_secret_ref, refcnt_dec_source_secret_ref, refcnt_inc_sink_secret_ref,
+    refcnt_inc_source_secret_ref,
+};
 use crate::controller::rename::{
     alter_relation_rename, alter_relation_rename_refs, ReplaceTableExprRewriter,
 };
+use crate::controller::utils::extract_external_table_name_from_definition;
 use crate::manager::catalog::utils::{refcnt_dec_connection, refcnt_inc_connection};
 use crate::rpc::ddl_controller::DropMode;
 use crate::telemetry::MetaTelemetryJobDesc;
@@ -158,6 +169,92 @@ impl CatalogManagerCore {
         let user = UserManager::new(env.clone(), &database).await?;
         Ok(Self { database, user })
     }
+
+    pub(crate) fn register_finish_notifier(
+        &mut self,
+        id: TableId,
+        sender: Sender<MetaResult<NotificationVersion>>,
+    ) {
+        self.database
+            .creating_table_finish_notifier
+            .entry(id)
+            .or_default()
+            .push(sender);
+    }
+
+    pub(crate) fn streaming_job_is_finished(&mut self, job: &StreamingJob) -> MetaResult<bool> {
+        fn gen_err(job: &StreamingJob, name: &String) -> MetaError {
+            MetaError::catalog_id_not_found(
+                job.job_type_str(),
+                format!("{} may have been dropped/cancelled", name),
+            )
+        }
+        let (job_status, name) = match job {
+            StreamingJob::MaterializedView(table) | StreamingJob::Table(_, table, _) => (
+                self.database
+                    .tables
+                    .get(&table.id)
+                    .map(|table| table.stream_job_status),
+                &table.name,
+            ),
+            StreamingJob::Sink(sink, _) => (
+                self.database
+                    .sinks
+                    .get(&sink.id)
+                    .map(|sink| sink.stream_job_status),
+                &sink.name,
+            ),
+            StreamingJob::Index(index, _) => (
+                self.database
+                    .indexes
+                    .get(&index.id)
+                    .map(|index| index.stream_job_status),
+                &index.name,
+            ),
+            StreamingJob::Source(source) => {
+                return Ok(self.database.sources.contains_key(&source.id));
+            }
+        };
+
+        job_status
+            .map(|status| status == StreamJobStatus::Created as i32)
+            .or_else(|| {
+                if self
+                    .database
+                    .in_progress_creating_streaming_job
+                    .contains_key(&job.id())
+                {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| gen_err(job, name))
+    }
+
+    pub(crate) fn notify_finish(&mut self, id: TableId, version: NotificationVersion) {
+        for tx in self
+            .database
+            .creating_table_finish_notifier
+            .remove(&id)
+            .into_iter()
+            .flatten()
+        {
+            let _ = tx.send(Ok(version));
+        }
+    }
+
+    pub(crate) fn notify_finish_failed(&mut self, err: &MetaError) {
+        for tx in take(&mut self.database.creating_table_finish_notifier)
+            .into_values()
+            .flatten()
+        {
+            let _ = tx.send(Err(err.clone()));
+        }
+        // Clear in progress creation streaming job. Note that background job is not tracked here, so that
+        // it won't affect background jobs.
+        self.database.in_progress_creating_streaming_job.clear();
+    }
 }
 
 impl CatalogManager {
@@ -172,7 +269,13 @@ impl CatalogManager {
         self.init_user().await?;
         self.init_database().await?;
         self.source_backward_compat_check().await?;
+        self.table_sink_catalog_update().await?;
+        self.table_catalog_cdc_table_id_update().await?;
         Ok(())
+    }
+
+    pub async fn current_notification_version(&self) -> NotificationVersion {
+        self.env.notification_manager().current_version().await
     }
 
     pub async fn get_catalog_core_guard(&self) -> MutexGuard<'_, CatalogManagerCore> {
@@ -186,6 +289,7 @@ impl CatalogManager {
     /// We identify a 'legacy' source based on two conditions:
     /// 1. The `format_encode_options` in `source_info` is empty.
     /// 2. Keys with certain prefixes belonging to `format_encode_options` exist in `with_properties` instead.
+    ///
     /// And if the source is identified as 'legacy', we copy the misplaced keys from `with_properties` to `format_encode_options`.
     async fn source_backward_compat_check(&self) -> MetaResult<()> {
         let core = &mut *self.core.lock().await;
@@ -221,6 +325,78 @@ impl CatalogManager {
             sources.insert(source.id, source);
         }
         commit_meta!(self, sources)?;
+        Ok(())
+    }
+
+    // Fill in the original_target_columns that wasn't written in the previous version for the table sink.
+    async fn table_sink_catalog_update(&self) -> MetaResult<()> {
+        let core = &mut *self.core.lock().await;
+        let mut sinks = BTreeMapTransaction::new(&mut core.database.sinks);
+        let tables = BTreeMapTransaction::new(&mut core.database.tables);
+        let legacy_sinks = sinks
+            .tree_ref()
+            .iter()
+            .filter(|(_, sink)| {
+                sink.target_table.is_some() && sink.original_target_columns.is_empty()
+            })
+            .map(|(_, sink)| sink.clone())
+            .collect_vec();
+
+        for mut sink in legacy_sinks {
+            let target_table = sink.target_table();
+            sink.original_target_columns
+                .clone_from(&tables.get(&target_table).unwrap().columns);
+            tracing::info!(
+                "updating sink {} target table columns {:?}",
+                sink.id,
+                sink.original_target_columns
+            );
+
+            sinks.insert(sink.id, sink);
+        }
+        commit_meta!(self, sinks)?;
+
+        Ok(())
+    }
+
+    // Fill in the `cdc_table_id` that wasn't written in the previous version for the table.
+    async fn table_catalog_cdc_table_id_update(&self) -> MetaResult<()> {
+        let core = &mut *self.core.lock().await;
+        let sources = BTreeMapTransaction::new(&mut core.database.sources);
+        let mut tables = BTreeMapTransaction::new(&mut core.database.tables);
+        let legacy_tables = tables
+            .tree_ref()
+            .iter()
+            .filter(|(_, table)| {
+                if let Some(rel_id) = table.dependent_relations.first()
+                    && sources.contains_key(rel_id)
+                    && table.table_type == TableType::Table as i32
+                    && table.cdc_table_id.is_none()
+                {
+                    true
+                } else {
+                    false
+                }
+            })
+            .map(|(_, table)| table.clone())
+            .collect_vec();
+        for mut table in legacy_tables {
+            let source_id = table.dependent_relations[0];
+            match extract_external_table_name_from_definition(&table.definition) {
+                None => {
+                    tracing::warn!(
+                        table_id = table.id,
+                        definition = table.definition,
+                        "failed to extract cdc table name from table definition.",
+                    )
+                }
+                Some(external_table_name) => {
+                    table.cdc_table_id = Some(build_cdc_table_id(source_id, &external_table_name));
+                }
+            }
+            tables.insert(table.id, table);
+        }
+        commit_meta!(self, tables)?;
         Ok(())
     }
 }
@@ -328,6 +504,7 @@ impl CatalogManager {
         let mut users = BTreeMapTransaction::new(&mut user_core.user_info);
         let mut functions = BTreeMapTransaction::new(&mut database_core.functions);
         let mut connections = BTreeMapTransaction::new(&mut database_core.connections);
+        let mut secrets = BTreeMapTransaction::new(&mut database_core.secrets);
 
         /// `drop_by_database_id` provides a wrapper for dropping relations by database id, it will
         /// return the relation ids that dropped.
@@ -360,6 +537,7 @@ impl CatalogManager {
             let views_to_drop = drop_by_database_id!(views, database_id);
             let functions_to_drop = drop_by_database_id!(functions, database_id);
             let connections_to_drop = drop_by_database_id!(connections, database_id);
+            let secrets_to_drop = drop_by_database_id!(secrets, database_id);
             connections_dropped = connections_to_drop.clone();
 
             let objects = std::iter::once(Object::DatabaseId(database_id))
@@ -421,6 +599,7 @@ impl CatalogManager {
                         .iter()
                         .map(|connection| connection.owner),
                 )
+                .chain(secrets_to_drop.iter().map(|secret| secret.owner))
                 .for_each(|owner_id| user_core.decrease_ref(owner_id));
 
             // Update relation ref count.
@@ -433,9 +612,8 @@ impl CatalogManager {
             for view in &views_to_drop {
                 database_core.relation_ref_count.remove(&view.id);
             }
-            // TODO(weili): wait for yezizp to refactor ref cnt
             for connection in &connections_to_drop {
-                database_core.relation_ref_count.remove(&connection.id);
+                database_core.connection_ref_count.remove(&connection.id);
             }
             for user in users_need_update {
                 self.notify_frontend(Operation::Update, Info::User(user))
@@ -447,19 +625,20 @@ impl CatalogManager {
                 .notify_frontend(Operation::Delete, Info::Database(database))
                 .await;
 
-            let catalog_deleted_ids = tables_to_drop
+            let streaming_job_deleted_ids = tables_to_drop
                 .into_iter()
                 .filter(|table| valid_table_name(&table.name))
                 .map(|table| StreamingJobId::new(table.id))
+                .chain(sources_to_drop.iter().filter_map(|source| {
+                    source
+                        .info
+                        .as_ref()
+                        .and_then(|info| info.is_shared().then(|| StreamingJobId::new(source.id)))
+                }))
                 .chain(
                     sinks_to_drop
                         .into_iter()
                         .map(|sink| StreamingJobId::new(sink.id)),
-                )
-                .chain(
-                    subscriptions_to_drop
-                        .into_iter()
-                        .map(|subscription| StreamingJobId::new(subscription.id)),
                 )
                 .collect_vec();
             let source_deleted_ids = sources_to_drop
@@ -469,12 +648,97 @@ impl CatalogManager {
 
             Ok((
                 version,
-                catalog_deleted_ids,
+                streaming_job_deleted_ids,
                 source_deleted_ids,
                 connections_dropped,
             ))
         } else {
             Err(MetaError::catalog_id_not_found("database", database_id))
+        }
+    }
+
+    pub async fn create_secret(
+        &self,
+        secret: Secret,
+        secret_plain_payload: Vec<u8>,
+    ) -> MetaResult<NotificationVersion> {
+        let core = &mut *self.core.lock().await;
+        let database_core = &mut core.database;
+        let user_core = &mut core.user;
+        database_core.ensure_database_id(secret.database_id)?;
+        database_core.ensure_schema_id(secret.schema_id)?;
+        #[cfg(not(test))]
+        user_core.ensure_user_id(secret.owner)?;
+        let key = (
+            secret.database_id as DatabaseId,
+            secret.schema_id as SchemaId,
+            secret.name.clone(),
+        );
+        database_core.check_secret_name_duplicated(&key)?;
+
+        let secret_id = secret.id;
+        let mut secret_entry = BTreeMapTransaction::new(&mut database_core.secrets);
+
+        secret_entry.insert(secret_id, secret.to_owned());
+        commit_meta!(self, secret_entry)?;
+
+        user_core.increase_ref(secret.owner);
+
+        // Notify the compute and frontend node plain secret
+        let mut secret_plain = secret;
+        secret_plain.value.clone_from(&secret_plain_payload);
+
+        LocalSecretManager::global().add_secret(secret_id, secret_plain_payload);
+        self.env
+            .notification_manager()
+            .notify_compute_without_version(Operation::Add, Info::Secret(secret_plain.clone()));
+
+        let version = self
+            .notify_frontend(Operation::Add, Info::Secret(secret_plain))
+            .await;
+
+        Ok(version)
+    }
+
+    pub async fn drop_secret(&self, secret_id: SecretId) -> MetaResult<NotificationVersion> {
+        let core = &mut *self.core.lock().await;
+        let database_core = &mut core.database;
+        let user_core = &mut core.user;
+        let mut secrets = BTreeMapTransaction::new(&mut database_core.secrets);
+
+        match database_core.secret_ref_count.get(&secret_id) {
+            Some(ref_count) => {
+                let secret_name = secrets
+                    .get(&secret_id)
+                    .ok_or_else(|| MetaError::catalog_id_not_found("connection", secret_id))?
+                    .name
+                    .clone();
+                Err(MetaError::permission_denied(format!(
+                    "Fail to delete secret {} because {} other relation(s) depend on it",
+                    secret_name, ref_count
+                )))
+            }
+            None => {
+                let secret = secrets
+                    .remove(secret_id)
+                    .ok_or_else(|| anyhow!("secret not found"))?;
+
+                commit_meta!(self, secrets)?;
+                user_core.decrease_ref(secret.owner);
+
+                LocalSecretManager::global().remove_secret(secret.id);
+                self.env
+                    .notification_manager()
+                    .notify_compute_without_version(
+                        Operation::Delete,
+                        Info::Secret(secret.clone()),
+                    );
+
+                let version = self
+                    .notify_frontend(Operation::Delete, Info::Secret(secret))
+                    .await;
+                Ok(version)
+            }
         }
     }
 
@@ -521,12 +785,11 @@ impl CatalogManager {
         let user_core = &mut core.user;
         let mut connections = BTreeMapTransaction::new(&mut database_core.connections);
 
-        // TODO(weili): wait for yezizp to refactor ref cnt
-        match database_core.relation_ref_count.get(&conn_id) {
+        match database_core.connection_ref_count.get(&conn_id) {
             Some(ref_count) => {
                 let connection_name = connections
                     .get(&conn_id)
-                    .ok_or_else(|| anyhow!("connection not found"))?
+                    .ok_or_else(|| MetaError::catalog_id_not_found("connection", conn_id))?
                     .name
                     .clone();
                 Err(MetaError::permission_denied(format!(
@@ -537,7 +800,7 @@ impl CatalogManager {
             None => {
                 let connection = connections
                     .remove(conn_id)
-                    .ok_or_else(|| anyhow!("connection not found"))?;
+                    .ok_or_else(|| MetaError::catalog_id_not_found("connection", conn_id))?;
 
                 commit_meta!(self, connections)?;
                 user_core.decrease_ref(connection.owner);
@@ -633,7 +896,7 @@ impl CatalogManager {
         user_core.increase_ref(view.owner);
 
         for &dependent_relation_id in &view.dependent_relations {
-            database_core.increase_ref_count(dependent_relation_id);
+            database_core.increase_relation_ref_count(dependent_relation_id);
         }
 
         let version = self
@@ -682,7 +945,7 @@ impl CatalogManager {
 
         let function = functions
             .remove(function_id)
-            .ok_or_else(|| anyhow!("function not found"))?;
+            .ok_or_else(|| MetaError::catalog_id_not_found("function", function_id))?;
 
         let objects = &[Object::FunctionId(function_id)];
         let users_need_update = Self::update_user_privileges(&mut users, objects);
@@ -712,7 +975,7 @@ impl CatalogManager {
     ) -> MetaResult<()> {
         match stream_job {
             StreamingJob::MaterializedView(table) => {
-                self.start_create_table_procedure(table, internal_tables)
+                self.start_create_materialized_view_procedure(table, internal_tables)
                     .await
             }
             StreamingJob::Sink(sink, _) => self.start_create_sink_procedure(sink).await,
@@ -724,8 +987,7 @@ impl CatalogManager {
                     self.start_create_table_procedure_with_source(source, table)
                         .await
                 } else {
-                    self.start_create_table_procedure(table, internal_tables)
-                        .await
+                    self.start_create_table_procedure(table).await
                 }
             }
             StreamingJob::Source(source) => self.start_create_source_procedure(source).await,
@@ -778,8 +1040,37 @@ impl CatalogManager {
             .await;
     }
 
-    /// This is used for both `CREATE TABLE` and `CREATE MATERIALIZED VIEW`.
-    pub async fn start_create_table_procedure(
+    /// This is used for both `CREATE TABLE`
+    pub async fn start_create_table_procedure(&self, table: &Table) -> MetaResult<()> {
+        let core = &mut *self.core.lock().await;
+        let database_core = &mut core.database;
+        let user_core = &mut core.user;
+        database_core.ensure_database_id(table.database_id)?;
+        database_core.ensure_schema_id(table.schema_id)?;
+        for dependent_id in &table.dependent_relations {
+            database_core.ensure_table_view_or_source_id(dependent_id)?;
+        }
+        #[cfg(not(test))]
+        user_core.ensure_user_id(table.owner)?;
+        let key = (table.database_id, table.schema_id, table.name.clone());
+
+        database_core.check_relation_name_duplicated(&key)?;
+
+        if database_core.has_in_progress_creation(&key) {
+            bail!("The table is being created");
+        } else {
+            database_core.mark_creating(&key);
+            database_core.mark_creating_streaming_job(table.id, key);
+            for &dependent_relation_id in &table.dependent_relations {
+                database_core.increase_relation_ref_count(dependent_relation_id);
+            }
+            user_core.increase_ref(table.owner);
+            Ok(())
+        }
+    }
+
+    /// This is used for `CREATE MATERIALIZED VIEW`.
+    pub async fn start_create_materialized_view_procedure(
         &self,
         table: &Table,
         internal_tables: Vec<Table>,
@@ -790,7 +1081,6 @@ impl CatalogManager {
         database_core.ensure_database_id(table.database_id)?;
         database_core.ensure_schema_id(table.schema_id)?;
         for dependent_id in &table.dependent_relations {
-            // TODO(zehua): refactor when using SourceId.
             database_core.ensure_table_view_or_source_id(dependent_id)?;
         }
         #[cfg(not(test))]
@@ -804,16 +1094,31 @@ impl CatalogManager {
             !tables.contains_key(&table.id),
             "table must not already exist in meta"
         );
-        for table in internal_tables {
-            tables.insert(table.id, table);
+        for table in &internal_tables {
+            tables.insert(table.id, table.clone());
         }
         tables.insert(table.id, table.clone());
         commit_meta!(self, tables)?;
 
         for &dependent_relation_id in &table.dependent_relations {
-            database_core.increase_ref_count(dependent_relation_id);
+            database_core.increase_relation_ref_count(dependent_relation_id);
         }
         user_core.increase_ref(table.owner);
+        let _version = self
+            .notify_frontend(
+                Operation::Add,
+                Info::RelationGroup(RelationGroup {
+                    relations: vec![Relation {
+                        relation_info: RelationInfo::Table(table.to_owned()).into(),
+                    }]
+                    .into_iter()
+                    .chain(internal_tables.into_iter().map(|internal_table| Relation {
+                        relation_info: RelationInfo::Table(internal_table).into(),
+                    }))
+                    .collect_vec(),
+                }),
+            )
+            .await;
         Ok(())
     }
 
@@ -845,6 +1150,7 @@ impl CatalogManager {
     ///    with:
     ///    1. `stream_job_status` = CREATING
     ///    2. Not belonging to a background stream job.
+    ///
     ///    Clean up these hanging tables by the id.
     pub async fn clean_dirty_tables(&self, fragment_manager: FragmentManagerRef) -> MetaResult<()> {
         let core = &mut *self.core.lock().await;
@@ -1009,17 +1315,111 @@ impl CatalogManager {
             if table.table_type != TableType::Internal as i32 {
                 // Recovered when init database manager.
                 for relation_id in &table.dependent_relations {
-                    database_core.decrease_ref_count(*relation_id);
+                    database_core.decrease_relation_ref_count(*relation_id);
                 }
                 // Recovered when init user manager.
                 tracing::debug!("decrease ref for {}", table.id);
                 user_core.decrease_ref(table.owner);
             }
         }
+        // Notify frontend of cleaned tables.
+        let relations = tables_to_clean
+            .into_iter()
+            .map(|table| Relation {
+                relation_info: RelationInfo::Table(table).into(),
+            })
+            .collect_vec();
+        self.notify_frontend(
+            Operation::Delete,
+            Info::RelationGroup(RelationGroup { relations }),
+        )
+        .await;
         Ok(())
     }
 
-    /// This is used for both `CREATE TABLE` and `CREATE MATERIALIZED VIEW`.
+    /// `finish_stream_job` finishes a stream job and clean some states.
+    pub async fn finish_stream_job(
+        &self,
+        mut stream_job: StreamingJob,
+        internal_tables: Vec<Table>,
+    ) -> MetaResult<()> {
+        // 1. finish procedure.
+        let mut creating_internal_table_ids = internal_tables.iter().map(|t| t.id).collect_vec();
+
+        // Update the corresponding 'created_at' field.
+        stream_job.mark_created();
+
+        let (version, table_id) = match stream_job {
+            StreamingJob::MaterializedView(table) => {
+                creating_internal_table_ids.push(table.id);
+                let table_id = table.id;
+                let version = self
+                    .finish_create_materialized_view_procedure(internal_tables, table)
+                    .await?;
+                (version, table_id)
+            }
+            StreamingJob::Sink(sink, target_table) => {
+                let sink_id = sink.id;
+
+                let mut version = self
+                    .finish_create_sink_procedure(internal_tables, sink)
+                    .await?;
+
+                if let Some((table, source)) = target_table {
+                    version = self
+                        .finish_replace_table_procedure(
+                            &source,
+                            &table,
+                            None,
+                            Some(sink_id),
+                            None,
+                            vec![],
+                        )
+                        .await?;
+                }
+
+                (version, sink_id)
+            }
+            StreamingJob::Table(source, table, ..) => {
+                creating_internal_table_ids.push(table.id);
+                let table_id = table.id;
+                let version = if let Some(source) = source {
+                    self.finish_create_table_procedure_with_source(source, table, internal_tables)
+                        .await?
+                } else {
+                    self.finish_create_table_procedure(internal_tables, table)
+                        .await?
+                };
+                (version, table_id)
+            }
+            StreamingJob::Index(index, table) => {
+                creating_internal_table_ids.push(table.id);
+                let table_id = table.id;
+                let version = self
+                    .finish_create_index_procedure(internal_tables, index, table)
+                    .await?;
+                (version, table_id)
+            }
+            StreamingJob::Source(source) => {
+                let table_id = source.id;
+                let version = self
+                    .finish_create_source_procedure(source, internal_tables)
+                    .await?;
+                (version, table_id)
+            }
+        };
+
+        // 2. unmark creating tables.
+        self.unmark_creating_tables(&creating_internal_table_ids, false)
+            .await;
+
+        // 3. notify create streaming job finish
+        self.core.lock().await.notify_finish(table_id, version);
+
+        Ok(())
+    }
+
+    /// This is used for `CREATE TABLE`.
     pub async fn finish_create_table_procedure(
         &self,
         mut internal_tables: Vec<Table>,
@@ -1027,11 +1427,17 @@ impl CatalogManager {
     ) -> MetaResult<NotificationVersion> {
         let core = &mut *self.core.lock().await;
         let database_core = &mut core.database;
-        let tables = &mut database_core.tables;
-        if cfg!(not(test)) {
-            Self::check_table_creating(tables, &table)?;
-        }
-        let mut tables = BTreeMapTransaction::new(tables);
+        let mut tables = BTreeMapTransaction::new(&mut database_core.tables);
+        let key = (table.database_id, table.schema_id, table.name.clone());
+        assert!(
+            !tables.contains_key(&table.id)
+                && database_core.in_progress_creation_tracker.contains(&key),
+            "table must be in creating procedure"
+        );
+        database_core.in_progress_creation_tracker.remove(&key);
+        database_core
+            .in_progress_creating_streaming_job
+            .remove(&table.id);
 
         table.stream_job_status = PbStreamJobStatus::Created.into();
         tables.insert(table.id, table.clone());
@@ -1061,71 +1467,162 @@ impl CatalogManager {
         Ok(version)
     }
 
-    /// Used to cleanup states in stream manager.
+    /// This is used for `CREATE MATERIALIZED VIEW`.
+    pub async fn finish_create_materialized_view_procedure(
+        &self,
+        mut internal_tables: Vec<Table>,
+        mut table: Table,
+    ) -> MetaResult<NotificationVersion> {
+        let core = &mut *self.core.lock().await;
+        let database_core = &mut core.database;
+        let tables = &mut database_core.tables;
+        if cfg!(not(test)) {
+            Self::check_table_creating(tables, &table)?;
+        }
+        let mut tables = BTreeMapTransaction::new(tables);
+
+        table.stream_job_status = PbStreamJobStatus::Created.into();
+        tables.insert(table.id, table.clone());
+        for table in &mut internal_tables {
+            table.stream_job_status = PbStreamJobStatus::Created.into();
+            tables.insert(table.id, table.clone());
+        }
+        commit_meta!(self, tables)?;
+
+        tracing::debug!(id = ?table.id, "notifying frontend");
+        let version = self
+            .notify_frontend(
+                Operation::Update,
+                Info::RelationGroup(RelationGroup {
+                    relations: vec![Relation {
+                        relation_info: RelationInfo::Table(table.to_owned()).into(),
+                    }]
+                    .into_iter()
+                    .chain(internal_tables.into_iter().map(|internal_table| Relation {
+                        relation_info: RelationInfo::Table(internal_table).into(),
+                    }))
+                    .collect_vec(),
+                }),
+            )
+            .await;
+
+        Ok(version)
+    }
+
+    /// Used to cleanup `CREATE MATERIALIZED VIEW` state in stream manager.
     /// It is required because failure may not necessarily happen in barrier,
     /// e.g. when cordon nodes.
     /// and we still need some way to cleanup the state.
     ///
     /// Returns false if `table_id` is not found.
-    pub async fn cancel_create_table_procedure(
+    pub async fn cancel_create_materialized_view_procedure(
         &self,
         table_id: TableId,
         internal_table_ids: Vec<TableId>,
     ) -> MetaResult<bool> {
-        let table = {
-            let core = &mut self.core.lock().await;
-            let database_core = &mut core.database;
-            let tables = &mut database_core.tables;
-            let Some(table) = tables.get(&table_id).cloned() else {
-                tracing::warn!(
-                    "table_id {} missing when attempting to cancel job, could be cleaned on recovery",
-                    table_id
-                );
-                return Ok(false);
-            };
-            // `Unspecified` maps to Created state, due to backwards compatibility.
-            // `Created` states should not be cancelled.
-            if table
-                .get_stream_job_status()
-                .unwrap_or(StreamJobStatus::Created)
-                != StreamJobStatus::Creating
-            {
-                return Err(MetaError::invalid_parameter(format!(
-                    "table is not in creating state id={:#?}",
-                    table_id
-                )));
-            }
-
-            tracing::trace!("cleanup tables for {}", table.id);
-            let mut table_ids = vec![table.id];
-            table_ids.extend(internal_table_ids);
-
-            let tables = &mut database_core.tables;
-            let mut tables = BTreeMapTransaction::new(tables);
-            for table_id in table_ids {
-                let res = tables.remove(table_id);
-                assert!(res.is_some(), "table_id {} missing", table_id);
-            }
-            commit_meta!(self, tables)?;
-            table
+        let core = &mut self.core.lock().await;
+        let database_core = &mut core.database;
+        let tables = &mut database_core.tables;
+        let Some(table) = tables.get(&table_id).cloned() else {
+            tracing::warn!(
+                "table_id {} missing when attempting to cancel job, could be cleaned on recovery",
+                table_id
+            );
+            return Ok(false);
         };
-
-        {
-            let core = &mut self.core.lock().await;
-            {
-                let user_core = &mut core.user;
-                user_core.decrease_ref(table.owner);
-            }
-
-            {
-                let database_core = &mut core.database;
-                for &dependent_relation_id in &table.dependent_relations {
-                    database_core.decrease_ref_count(dependent_relation_id);
-                }
+        let mut internal_tables = vec![];
+        for internal_table_id in &internal_table_ids {
+            if let Some(table) = tables.get(internal_table_id) {
+                internal_tables.push(table.clone());
             }
         }
 
+        // `Unspecified` maps to Created state, due to backwards compatibility.
+        // `Created` states should not be cancelled.
+        if table
+            .get_stream_job_status()
+            .unwrap_or(StreamJobStatus::Created)
+            != StreamJobStatus::Creating
+        {
+            return Err(MetaError::invalid_parameter(format!(
+                "table is not in creating state id={:#?}",
+                table_id
+            )));
+        }
+
+        tracing::trace!("cleanup tables for {}", table.id);
+        let mut table_ids = vec![table.id];
+        table_ids.extend(internal_table_ids);
+
+        let tables = &mut database_core.tables;
+        let mut tables = BTreeMapTransaction::new(tables);
+        for table_id in table_ids {
+            let res = tables.remove(table_id);
+            assert!(res.is_some(), "table_id {} missing", table_id);
+        }
+        commit_meta!(self, tables)?;
+
+        {
+            let user_core = &mut core.user;
+            user_core.decrease_ref(table.owner);
+        }
+
+        {
+            let database_core = &mut core.database;
+            for &dependent_relation_id in &table.dependent_relations {
+                database_core.decrease_relation_ref_count(dependent_relation_id);
+            }
+        }
+
+        for tx in core
+            .database
+            .creating_table_finish_notifier
+            .remove(&table_id)
+            .into_iter()
+            .flatten()
+        {
+            let _ = tx.send(Err(MetaError::cancelled(format!(
+                "materialized view {table_id} has been cancelled"
+            ))));
+        }
+
+        // FIXME(kwannoel): Propagate version to fe
+        let _version = self
+            .notify_frontend(
+                Operation::Delete,
+                Info::RelationGroup(RelationGroup {
+                    relations: vec![Relation {
+                        relation_info: RelationInfo::Table(table.to_owned()).into(),
+                    }]
+                    .into_iter()
+                    .chain(internal_tables.into_iter().map(|internal_table| Relation {
+                        relation_info: RelationInfo::Table(internal_table).into(),
+                    }))
+                    .collect_vec(),
+                }),
+            )
+            .await;
+
         Ok(true)
+    }
+
+    /// Used to cleanup `CREATE TABLE` state in stream manager.
+    pub async fn cancel_create_table_procedure(&self, table: &Table) {
+        let core = &mut *self.core.lock().await;
+        let database_core = &mut core.database;
+        let user_core = &mut core.user;
+        let key = (table.database_id, table.schema_id, table.name.clone());
+        assert!(
+            !database_core.tables.contains_key(&table.id)
+                && database_core.has_in_progress_creation(&key),
+            "table must be in creating procedure"
+        );
+        database_core.unmark_creating(&key);
+        database_core.unmark_creating_streaming_job(table.id);
+        for &dependent_relation_id in &table.dependent_relations {
+            database_core.decrease_relation_ref_count(dependent_relation_id);
+        }
+        user_core.decrease_ref(table.owner);
     }
 
     /// return id of streaming jobs in the database which need to be dropped by stream manager.
@@ -1314,15 +1811,11 @@ impl CatalogManager {
                     all_table_ids.extend(index_table_ids.iter().cloned());
 
                     for index_table_id in &index_table_ids {
-                        let internal_table_ids = match fragment_manager
+                        let internal_table_ids = fragment_manager
                             .select_table_fragments_by_table_id(&(index_table_id.into()))
                             .await
                             .map(|fragments| fragments.internal_table_ids())
-                        {
-                            Ok(v) => v,
-                            // Handle backwards compat with no state persistence.
-                            Err(_) => vec![],
-                        };
+                            .unwrap_or_default();
 
                         // 1 should be used by table scan.
                         if internal_table_ids.len() == 1 {
@@ -1404,15 +1897,11 @@ impl CatalogManager {
                     }
                     all_table_ids.insert(index.index_table_id);
 
-                    let internal_table_ids = match fragment_manager
+                    let internal_table_ids = fragment_manager
                         .select_table_fragments_by_table_id(&(index.index_table_id.into()))
                         .await
                         .map(|fragments| fragments.internal_table_ids())
-                    {
-                        Ok(v) => v,
-                        // Handle backwards compat with no state persistence.
-                        Err(_) => vec![],
-                    };
+                        .unwrap_or_default();
 
                     // 1 should be used by table scan.
                     if internal_table_ids.len() == 1 {
@@ -1677,14 +2166,13 @@ impl CatalogManager {
             user_core.decrease_ref(index.owner);
         }
 
-        // `tables_removed` contains both index table and mv.
+        // `tables_removed` contains both index, table and mv.
         for table in &tables_removed {
             user_core.decrease_ref(table.owner);
         }
 
         for source in &sources_removed {
             user_core.decrease_ref(source.owner);
-            refcnt_dec_connection(database_core, source.connection_id);
         }
 
         for view in &views_removed {
@@ -1707,28 +2195,31 @@ impl CatalogManager {
         // decrease dependent relations
         for table in &tables_removed {
             for dependent_relation_id in &table.dependent_relations {
-                database_core.decrease_ref_count(*dependent_relation_id);
+                database_core.decrease_relation_ref_count(*dependent_relation_id);
             }
+        }
+
+        for source in &sources_removed {
+            refcnt_dec_connection(database_core, source.connection_id);
+            refcnt_dec_source_secret_ref(database_core, source)?;
         }
 
         for view in &views_removed {
             for dependent_relation_id in &view.dependent_relations {
-                database_core.decrease_ref_count(*dependent_relation_id);
+                database_core.decrease_relation_ref_count(*dependent_relation_id);
             }
         }
 
         for sink in &sinks_removed {
-            if let Some(connection_id) = sink.connection_id {
-                // TODO(siyuan): wait for yezizp to refactor ref cnt
-                database_core.decrease_ref_count(connection_id);
-            }
+            refcnt_dec_connection(database_core, sink.connection_id);
             for dependent_relation_id in &sink.dependent_relations {
-                database_core.decrease_ref_count(*dependent_relation_id);
+                database_core.decrease_relation_ref_count(*dependent_relation_id);
             }
+            refcnt_dec_sink_secret_ref(database_core, sink);
         }
 
         for subscription in &subscriptions_removed {
-            database_core.decrease_ref_count(subscription.dependent_table_id);
+            database_core.decrease_relation_ref_count(subscription.dependent_table_id);
         }
 
         let version = self
@@ -2141,7 +2632,7 @@ impl CatalogManager {
         Ok(version)
     }
 
-    pub async fn alter_source_column(&self, source: Source) -> MetaResult<NotificationVersion> {
+    pub async fn alter_source(&self, source: Source) -> MetaResult<NotificationVersion> {
         let source_id = source.get_id();
         let core = &mut *self.core.lock().await;
         let database_core = &mut core.database;
@@ -2728,6 +3219,7 @@ impl CatalogManager {
         } else {
             database_core.mark_creating(&key);
             user_core.increase_ref(source.owner);
+            refcnt_inc_source_secret_ref(database_core, source)?;
             // We have validate the status of connection before starting the procedure.
             refcnt_inc_connection(database_core, source.connection_id)?;
             Ok(())
@@ -2743,7 +3235,7 @@ impl CatalogManager {
         database_core
             .get_connection(connection_id)
             .cloned()
-            .ok_or_else(|| anyhow!(format!("could not find connection {}", connection_id)).into())
+            .ok_or_else(|| MetaError::catalog_id_not_found("connection", connection_id))
     }
 
     pub async fn finish_create_source_procedure(
@@ -2803,6 +3295,7 @@ impl CatalogManager {
         database_core.unmark_creating(&key);
         user_core.decrease_ref(source.owner);
         refcnt_dec_connection(database_core, source.connection_id);
+        refcnt_dec_source_secret_ref(database_core, source)?;
         Ok(())
     }
 
@@ -2835,6 +3328,7 @@ impl CatalogManager {
             // source and table
             user_core.increase_ref_count(source.owner, 2);
 
+            refcnt_inc_source_secret_ref(database_core, source)?;
             // We have validate the status of connection before starting the procedure.
             refcnt_inc_connection(database_core, source.connection_id)?;
             Ok(())
@@ -2872,7 +3366,7 @@ impl CatalogManager {
             .in_progress_creation_tracker
             .remove(&mview_key);
         database_core
-            .in_progress_creation_streaming_job
+            .in_progress_creating_streaming_job
             .remove(&mview.id);
 
         sources.insert(source.id, source.clone());
@@ -2908,7 +3402,11 @@ impl CatalogManager {
         Ok(version)
     }
 
-    pub async fn cancel_create_table_procedure_with_source(&self, source: &Source, table: &Table) {
+    pub async fn cancel_create_table_procedure_with_source(
+        &self,
+        source: &Source,
+        table: &Table,
+    ) -> MetaResult<()> {
         let core = &mut *self.core.lock().await;
         let database_core = &mut core.database;
         let user_core = &mut core.user;
@@ -2925,6 +3423,8 @@ impl CatalogManager {
         database_core.unmark_creating_streaming_job(table.id);
         user_core.decrease_ref_count(source.owner, 2); // source and table
         refcnt_dec_connection(database_core, source.connection_id);
+        refcnt_dec_source_secret_ref(database_core, source)?;
+        Ok(())
     }
 
     pub async fn start_create_index_procedure(
@@ -2954,7 +3454,7 @@ impl CatalogManager {
             database_core.mark_creating(&key);
             database_core.mark_creating_streaming_job(index_table.id, key);
             for &dependent_relation_id in &index_table.dependent_relations {
-                database_core.increase_ref_count(dependent_relation_id);
+                database_core.increase_relation_ref_count(dependent_relation_id);
             }
             // index table and index.
             user_core.increase_ref_count(index.owner, 2);
@@ -2975,7 +3475,7 @@ impl CatalogManager {
         database_core.unmark_creating(&key);
         database_core.unmark_creating_streaming_job(index_table.id);
         for &dependent_relation_id in &index_table.dependent_relations {
-            database_core.decrease_ref_count(dependent_relation_id);
+            database_core.decrease_relation_ref_count(dependent_relation_id);
         }
         // index table and index.
         user_core.decrease_ref_count(index.owner, 2);
@@ -3001,7 +3501,7 @@ impl CatalogManager {
 
         database_core.in_progress_creation_tracker.remove(&key);
         database_core
-            .in_progress_creation_streaming_job
+            .in_progress_creating_streaming_job
             .remove(&table.id);
 
         index.stream_job_status = PbStreamJobStatus::Created.into();
@@ -3046,7 +3546,6 @@ impl CatalogManager {
         database_core.ensure_database_id(sink.database_id)?;
         database_core.ensure_schema_id(sink.schema_id)?;
         for dependent_id in &sink.dependent_relations {
-            // TODO(zehua): refactor when using SourceId.
             database_core.ensure_table_view_or_source_id(dependent_id)?;
         }
         let key = (sink.database_id, sink.schema_id, sink.name.clone());
@@ -3060,9 +3559,10 @@ impl CatalogManager {
             database_core.mark_creating(&key);
             database_core.mark_creating_streaming_job(sink.id, key);
             for &dependent_relation_id in &sink.dependent_relations {
-                database_core.increase_ref_count(dependent_relation_id);
+                database_core.increase_relation_ref_count(dependent_relation_id);
             }
             user_core.increase_ref(sink.owner);
+            refcnt_inc_sink_secret_ref(database_core, sink);
             // We have validate the status of connection before starting the procedure.
             refcnt_inc_connection(database_core, sink.connection_id)?;
             Ok(())
@@ -3087,7 +3587,7 @@ impl CatalogManager {
 
         database_core.in_progress_creation_tracker.remove(&key);
         database_core
-            .in_progress_creation_streaming_job
+            .in_progress_creating_streaming_job
             .remove(&sink.id);
 
         sink.stream_job_status = PbStreamJobStatus::Created.into();
@@ -3134,10 +3634,11 @@ impl CatalogManager {
         database_core.unmark_creating(&key);
         database_core.unmark_creating_streaming_job(sink.id);
         for &dependent_relation_id in &sink.dependent_relations {
-            database_core.decrease_ref_count(dependent_relation_id);
+            database_core.decrease_relation_ref_count(dependent_relation_id);
         }
         user_core.decrease_ref(sink.owner);
         refcnt_dec_connection(database_core, sink.connection_id);
+        refcnt_dec_sink_secret_ref(database_core, sink);
 
         if let Some((table, source)) = target_table {
             Self::cancel_replace_table_procedure_inner(source, table, core);
@@ -3169,7 +3670,7 @@ impl CatalogManager {
         } else {
             database_core.mark_creating(&key);
             database_core.mark_creating_streaming_job(subscription.id, key);
-            database_core.increase_ref_count(subscription.dependent_table_id);
+            database_core.increase_relation_ref_count(subscription.dependent_table_id);
             user_core.increase_ref(subscription.owner);
             let mut subscriptions = BTreeMapTransaction::new(&mut database_core.subscriptions);
             subscriptions.insert(subscription.id, subscription.clone());
@@ -3187,7 +3688,7 @@ impl CatalogManager {
         let mut subscriptions = BTreeMapTransaction::new(&mut database_core.subscriptions);
         let mut subscription = subscriptions
             .get(&subscription_id)
-            .ok_or_else(|| anyhow!("subscription not found"))?
+            .ok_or_else(|| MetaError::catalog_id_not_found("subscription", subscription_id))?
             .clone();
         subscription.created_at_cluster_version = Some(current_cluster_version());
         subscription.created_at_epoch = Some(Epoch::now().0);
@@ -3205,7 +3706,7 @@ impl CatalogManager {
 
         database_core.in_progress_creation_tracker.remove(&key);
         database_core
-            .in_progress_creation_streaming_job
+            .in_progress_creating_streaming_job
             .remove(&subscription.id);
 
         subscription.subscription_state = PbSubscriptionState::Created.into();
@@ -3223,7 +3724,7 @@ impl CatalogManager {
         let subscriptions = BTreeMapTransaction::new(&mut database_core.subscriptions);
         let subscription = subscriptions
             .get(&subscription_id)
-            .ok_or_else(|| anyhow!("subscription not found"))?
+            .ok_or_else(|| MetaError::catalog_id_not_found("subscription", subscription_id))?
             .clone();
         assert_eq!(
             subscription.subscription_state,
@@ -3272,7 +3773,7 @@ impl CatalogManager {
 
             database_core.unmark_creating(&key);
             database_core.unmark_creating_streaming_job(subscription.id);
-            database_core.decrease_ref_count(subscription.dependent_table_id);
+            database_core.decrease_relation_ref_count(subscription.dependent_table_id);
             user_core.decrease_ref(subscription.owner);
         }
         Ok(())
@@ -3280,7 +3781,7 @@ impl CatalogManager {
 
     /// This is used for `ALTER TABLE ADD/DROP COLUMN`.
     pub async fn start_replace_table_procedure(&self, stream_job: &StreamingJob) -> MetaResult<()> {
-        let StreamingJob::Table(source, table, ..) = stream_job else {
+        let StreamingJob::Table(source, table, job_type) = stream_job else {
             unreachable!("unexpected job: {stream_job:?}")
         };
         let core = &mut *self.core.lock().await;
@@ -3288,7 +3789,10 @@ impl CatalogManager {
         database_core.ensure_database_id(table.database_id)?;
         database_core.ensure_schema_id(table.schema_id)?;
 
-        assert!(table.dependent_relations.is_empty());
+        // general table streaming job should not have dependent relations
+        if matches!(job_type, TableJobType::General) {
+            assert!(table.dependent_relations.is_empty());
+        }
 
         let key = (table.database_id, table.schema_id, table.name.clone());
         let original_table = database_core
@@ -3317,7 +3821,7 @@ impl CatalogManager {
         }
     }
 
-    /// This is used for `ALTER TABLE ADD/DROP COLUMN`.
+    /// This is used for `ALTER TABLE ADD/DROP COLUMN` and `SINK INTO TABLE`.
     pub async fn finish_replace_table_procedure(
         &self,
         source: &Option<Source>,
@@ -3325,12 +3829,14 @@ impl CatalogManager {
         table_col_index_mapping: Option<ColIndexMapping>,
         creating_sink_id: Option<SinkId>,
         dropping_sink_id: Option<SinkId>,
+        updated_sink_ids: Vec<SinkId>,
     ) -> MetaResult<NotificationVersion> {
         let core = &mut *self.core.lock().await;
         let database_core = &mut core.database;
         let mut tables = BTreeMapTransaction::new(&mut database_core.tables);
         let mut sources = BTreeMapTransaction::new(&mut database_core.sources);
         let mut indexes = BTreeMapTransaction::new(&mut database_core.indexes);
+        let mut sinks = BTreeMapTransaction::new(&mut database_core.sinks);
         let key = (table.database_id, table.schema_id, table.name.clone());
 
         assert!(
@@ -3338,6 +3844,15 @@ impl CatalogManager {
                 && database_core.in_progress_creation_tracker.contains(&key),
             "table must exist and be in altering procedure"
         );
+
+        let original_table = tables.get(&table.id).unwrap();
+        let mut updated_sinks = vec![];
+        for sink_id in updated_sink_ids {
+            let mut sink = sinks.get_mut(sink_id).unwrap();
+            sink.original_target_columns
+                .clone_from(&original_table.columns);
+            updated_sinks.push(sink.clone());
+        }
 
         if let Some(source) = source {
             let source_key = (source.database_id, source.schema_id, source.name.clone());
@@ -3396,7 +3911,7 @@ impl CatalogManager {
 
         tables.insert(table.id, table.clone());
 
-        commit_meta!(self, tables, indexes, sources)?;
+        commit_meta!(self, tables, indexes, sources, sinks)?;
 
         // Group notification
         let version = self
@@ -3412,6 +3927,9 @@ impl CatalogManager {
                     }))
                     .chain(updated_indexes.into_iter().map(|index| Relation {
                         relation_info: RelationInfo::Index(index).into(),
+                    }))
+                    .chain(updated_sinks.into_iter().map(|sink| Relation {
+                        relation_info: RelationInfo::Sink(sink).into(),
                     }))
                     .collect_vec(),
                 }),
@@ -3442,8 +3960,6 @@ impl CatalogManager {
     ) {
         let database_core = &mut core.database;
         let key = (table.database_id, table.schema_id, table.name.clone());
-
-        assert!(table.dependent_relations.is_empty());
 
         assert!(
             database_core.tables.contains_key(&table.id)
@@ -3640,6 +4156,14 @@ impl CatalogManager {
             .get_table_name_and_type_mapping()
     }
 
+    pub async fn get_table_by_cdc_table_id(&self, cdc_table_id: &String) -> Vec<Table> {
+        self.core
+            .lock()
+            .await
+            .database
+            .get_table_by_cdc_table_id(cdc_table_id)
+    }
+
     /// `list_stream_job_ids` returns all running and creating stream job ids, this is for recovery
     /// clean up progress.
     pub async fn list_stream_job_ids(&self) -> MetaResult<HashSet<TableId>> {
@@ -3691,6 +4215,14 @@ impl CatalogManager {
                         referenced_object_id: *incoming_sinks,
                     });
                 }
+            }
+        }
+        for view in core.views.values() {
+            for referenced in &view.dependent_relations {
+                dependencies.push(PbObjectDependencies {
+                    object_id: view.id,
+                    referenced_object_id: *referenced,
+                });
             }
         }
         for sink in core.sinks.values() {
@@ -3761,8 +4293,35 @@ impl CatalogManager {
             .database
             .subscriptions
             .get(&subscription_id)
-            .ok_or_else(|| anyhow!("cant find subscription with id {}", subscription_id))?;
+            .ok_or_else(|| MetaError::catalog_id_not_found("subscription", subscription_id))?;
         Ok(subscription.clone())
+    }
+
+    pub async fn get_mv_depended_subscriptions(
+        &self,
+    ) -> MetaResult<HashMap<risingwave_common::catalog::TableId, HashMap<u32, u64>>> {
+        let guard = self.core.lock().await;
+        let mut map = HashMap::new();
+        for subscription in guard.database.subscriptions.values() {
+            map.entry(risingwave_common::catalog::TableId::from(
+                subscription.dependent_table_id,
+            ))
+            .or_insert(HashMap::new())
+            .insert(subscription.id, subscription.retention_seconds);
+        }
+
+        Ok(map)
+    }
+
+    pub async fn get_sinks(&self, sink_ids: &[SinkId]) -> Vec<Sink> {
+        let mut sinks = vec![];
+        let guard = self.core.lock().await;
+        for sink_id in sink_ids {
+            if let Some(sink) = guard.database.sinks.get(sink_id) {
+                sinks.push(sink.clone());
+            }
+        }
+        sinks
     }
 
     pub async fn get_created_table_ids(&self) -> Vec<u32> {
@@ -3950,7 +4509,7 @@ impl CatalogManager {
         core.user_info
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow!("User {} not found", id).into())
+            .ok_or_else(|| MetaError::catalog_id_not_found("user", id))
     }
 
     pub async fn drop_user(&self, id: UserId) -> MetaResult<NotificationVersion> {
@@ -3969,7 +4528,7 @@ impl CatalogManager {
                 id
             )));
         }
-        if user_core.catalog_create_ref_count.get(&id).is_some() {
+        if user_core.catalog_create_ref_count.contains_key(&id) {
             return Err(MetaError::permission_denied(format!(
                 "User {} cannot be dropped because some objects depend on it",
                 user.name
@@ -4080,11 +4639,11 @@ impl CatalogManager {
         let grantor_info = users
             .get(&grantor)
             .cloned()
-            .ok_or_else(|| anyhow!("User {} does not exist", &grantor))?;
+            .ok_or_else(|| MetaError::catalog_id_not_found("user", grantor))?;
         for user_id in user_ids {
             let mut user = users
                 .get_mut(*user_id)
-                .ok_or_else(|| anyhow!("User {} does not exist", user_id))?;
+                .ok_or_else(|| MetaError::catalog_id_not_found("user", user_id))?;
 
             if user.is_super {
                 return Err(MetaError::permission_denied(format!(
@@ -4207,7 +4766,7 @@ impl CatalogManager {
         // check revoke permission
         let revoke_by = users
             .get(&revoke_by)
-            .ok_or_else(|| anyhow!("User {} does not exist", &revoke_by))?;
+            .ok_or_else(|| MetaError::catalog_id_not_found("user", revoke_by))?;
         let same_user = granted_by == revoke_by.id;
         if !revoke_by.is_super {
             for privilege in revoke_grant_privileges {
@@ -4242,7 +4801,7 @@ impl CatalogManager {
             let user = users
                 .get(user_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("User {} does not exist", user_id))?;
+                .ok_or_else(|| MetaError::catalog_id_not_found("user", user_id))?;
             if user.is_super {
                 return Err(MetaError::permission_denied(format!(
                     "Cannot revoke privilege from supper user {}",
@@ -4340,5 +4899,56 @@ impl CatalogManager {
             }
         }
         users_need_update
+    }
+
+    pub async fn update_source_rate_limit_by_source_id(
+        &self,
+        source_id: SourceId,
+        rate_limit: Option<u32>,
+    ) -> MetaResult<()> {
+        let source_relation: PbSource;
+        {
+            let core = &mut *self.core.lock().await;
+            let database_core = &mut core.database;
+            let mut sources = BTreeMapTransaction::new(&mut database_core.sources);
+            let mut source = sources.get_mut(source_id);
+            let Some(source_catalog) = source.as_mut() else {
+                bail!("source {} not found", source_id)
+            };
+            source_relation = source_catalog.clone();
+            source_catalog.rate_limit = rate_limit;
+            commit_meta!(self, sources)?;
+        }
+
+        let _version = self
+            .notify_frontend(
+                Operation::Update,
+                Info::RelationGroup(RelationGroup {
+                    relations: vec![Relation {
+                        relation_info: RelationInfo::Source(source_relation).into(),
+                    }],
+                }),
+            )
+            .await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::manager::catalog::extract_external_table_name_from_definition;
+
+    #[test]
+    fn test_extract_cdc_table_name() {
+        let ddl1 = "CREATE TABLE t1 () FROM pg_source TABLE 'public.t1'";
+        let ddl2 = "CREATE TABLE t2 (v1 int) FROM pg_source TABLE 'mydb.t2'";
+        assert_eq!(
+            extract_external_table_name_from_definition(ddl1),
+            Some("public.t1".into())
+        );
+        assert_eq!(
+            extract_external_table_name_from_definition(ddl2),
+            Some("mydb.t2".into())
+        );
     }
 }

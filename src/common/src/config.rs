@@ -24,7 +24,7 @@ use std::num::NonZeroUsize;
 use anyhow::Context;
 use clap::ValueEnum;
 use educe::Educe;
-use foyer::{LfuConfig, LruConfig, S3FifoConfig};
+use foyer::{Compression, LfuConfig, LruConfig, RecoverMode, RuntimeConfig, S3FifoConfig};
 use risingwave_common_proc_macro::ConfigDoc;
 pub use risingwave_common_proc_macro::OverrideConfig;
 use risingwave_pb::meta::SystemParams;
@@ -33,7 +33,6 @@ use serde_default::DefaultFromSerde;
 use serde_json::Value;
 
 use crate::for_all_params;
-use crate::hash::VirtualNode;
 
 /// Use the maximum value for HTTP/2 connection window size to avoid deadlock among multiplexed
 /// streams on the same connection.
@@ -175,7 +174,10 @@ pub enum MetaBackend {
     #[default]
     Mem,
     Etcd,
-    Sql,
+    Sql, // keep for backward compatibility
+    Sqlite,
+    Postgres,
+    Mysql,
 }
 
 /// The section `[meta]` in `risingwave.toml`.
@@ -189,6 +191,10 @@ pub struct MetaConfig {
     /// Interval of automatic hummock full GC.
     #[serde(default = "default::meta::full_gc_interval_sec")]
     pub full_gc_interval_sec: u64,
+
+    /// Max number of object per full GC job can fetch.
+    #[serde(default = "default::meta::full_gc_object_limit")]
+    pub full_gc_object_limit: u64,
 
     /// The spin interval when collecting global GC watermark in hummock.
     #[serde(default = "default::meta::collect_gc_watermark_spin_interval_sec")]
@@ -219,6 +225,12 @@ pub struct MetaConfig {
     /// version delta need to be manually deleted.
     #[serde(default = "default::meta::enable_hummock_data_archive")]
     pub enable_hummock_data_archive: bool,
+
+    /// The interval at which a Hummock version snapshot is taken for time travel.
+    ///
+    /// Larger value indicates less storage overhead but worse query performance.
+    #[serde(default = "default::meta::hummock_time_travel_snapshot_interval")]
+    pub hummock_time_travel_snapshot_interval: u64,
 
     /// The minimum delta log number a new checkpoint should compact, otherwise the checkpoint
     /// attempt is rejected.
@@ -290,8 +302,11 @@ pub struct MetaConfig {
     #[serde(default = "default::meta::periodic_tombstone_reclaim_compaction_interval_sec")]
     pub periodic_tombstone_reclaim_compaction_interval_sec: u64,
 
-    #[serde(default = "default::meta::periodic_split_compact_group_interval_sec")]
-    pub periodic_split_compact_group_interval_sec: u64,
+    #[serde(
+        default = "default::meta::periodic_scheduling_compaction_group_interval_sec",
+        alias = "periodic_split_compact_group_interval_sec"
+    )]
+    pub periodic_scheduling_compaction_group_interval_sec: u64,
 
     #[serde(default = "default::meta::move_table_size_limit")]
     pub move_table_size_limit: u64,
@@ -300,6 +315,7 @@ pub struct MetaConfig {
     pub split_group_size_limit: u64,
 
     #[serde(default = "default::meta::cut_table_size_limit")]
+    #[deprecated]
     pub cut_table_size_limit: u64,
 
     #[serde(default, flatten)]
@@ -309,9 +325,12 @@ pub struct MetaConfig {
     #[serde(default)]
     pub do_not_config_object_storage_lifecycle: bool,
 
+    /// Count of partition in split group. Meta will assign this value to every new group when it splits from default-group by automatically.
+    /// Each partition contains aligned data of `vnode_count / partition_vnode_count` consecutive virtual-nodes of one state table.
     #[serde(default = "default::meta::partition_vnode_count")]
     pub partition_vnode_count: u32,
 
+    /// The threshold of write throughput to trigger a group split. Increase this configuration value to avoid split too many groups with few data write.
     #[serde(default = "default::meta::table_write_throughput_threshold")]
     pub table_write_throughput_threshold: u64,
 
@@ -334,8 +353,23 @@ pub struct MetaConfig {
     #[config_doc(nested)]
     pub compaction_config: CompactionConfig,
 
-    #[serde(default = "default::meta::hybird_partition_vnode_count")]
-    pub hybird_partition_vnode_count: u32,
+    /// Count of partitions of tables in default group and materialized view group.
+    /// The meta node will decide according to some strategy whether to cut the boundaries of the file according to the vnode alignment.
+    /// Each partition contains aligned data of `vnode_count / hybrid_partition_vnode_count` consecutive virtual-nodes of one state table.
+    /// Set it zero to disable this feature.
+    #[serde(default = "default::meta::hybrid_partition_vnode_count")]
+    pub hybrid_partition_vnode_count: u32,
+
+    /// The threshold of table size in one compact task to decide whether to partition one table into `hybrid_partition_vnode_count` parts, which belongs to default group and materialized view group.
+    /// Set it max value of 64-bit number to disable this feature.
+    #[serde(default = "default::meta::compact_task_table_size_partition_threshold_low")]
+    pub compact_task_table_size_partition_threshold_low: u64,
+
+    /// The threshold of table size in one compact task to decide whether to partition one table into `partition_vnode_count` parts, which belongs to default group and materialized view group.
+    /// Set it max value of 64-bit number to disable this feature.
+    #[serde(default = "default::meta::compact_task_table_size_partition_threshold_high")]
+    pub compact_task_table_size_partition_threshold_high: u64,
+
     #[serde(default = "default::meta::event_log_enabled")]
     pub event_log_enabled: bool,
     /// Keeps the latest N events per channel.
@@ -400,16 +434,13 @@ impl<'de> Deserialize<'de> for DefaultParallelism {
                     )))
                 }
             }
-            Parallelism::Int(i) => Ok(DefaultParallelism::Default(if i > VirtualNode::COUNT {
-                Err(serde::de::Error::custom(format!(
-                    "default parallelism should be not great than {}",
-                    VirtualNode::COUNT
-                )))?
-            } else {
+            Parallelism::Int(i) => Ok(DefaultParallelism::Default(
+                // Note: we won't check whether this exceeds the maximum parallelism (i.e., vnode count)
+                // here because it requires extra context. The check will be done when scheduling jobs.
                 NonZeroUsize::new(i).ok_or_else(|| {
-                    serde::de::Error::custom("default parallelism should be greater than 0")
-                })?
-            })),
+                    serde::de::Error::custom("default parallelism should not be 0")
+                })?,
+            )),
         }
     }
 }
@@ -439,6 +470,20 @@ pub struct MetaDeveloperConfig {
 
     #[serde(default = "default::developer::max_get_task_probe_times")]
     pub max_get_task_probe_times: usize,
+
+    /// Max number of actor allowed per parallelism (default = 100).
+    /// CREATE MV/Table will be noticed when the number of actors exceeds this limit.
+    #[serde(default = "default::developer::actor_cnt_per_worker_parallelism_soft_limit")]
+    pub actor_cnt_per_worker_parallelism_soft_limit: usize,
+
+    /// Max number of actor allowed per parallelism (default = 400).
+    /// CREATE MV/Table will be rejected when the number of actors exceeds this limit.
+    #[serde(default = "default::developer::actor_cnt_per_worker_parallelism_hard_limit")]
+    pub actor_cnt_per_worker_parallelism_hard_limit: usize,
+
+    #[serde(default = "default::developer::hummock_time_travel_sst_info_fetch_batch_size")]
+    /// Max number of SSTs fetched from meta store per SELECT, during time travel Hummock version replay.
+    pub hummock_time_travel_sst_info_fetch_batch_size: usize,
 }
 
 /// The section `[server]` in `risingwave.toml`.
@@ -448,8 +493,14 @@ pub struct ServerConfig {
     #[serde(default = "default::server::heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u32,
 
+    /// The default number of the connections when connecting to a gRPC server.
+    ///
+    /// For the connections used in streaming or batch exchange, please refer to the entries in
+    /// `[stream.developer]` and `[batch.developer]` sections. This value will be used if they
+    /// are not specified.
     #[serde(default = "default::server::connection_pool_size")]
-    pub connection_pool_size: u16,
+    // Intentionally made private to avoid abuse. Check the related methods on `RwConfig`.
+    connection_pool_size: u16,
 
     /// Used for control the metrics level, similar to log level.
     #[serde(default = "default::server::metrics_level")]
@@ -509,6 +560,15 @@ pub struct BatchConfig {
     /// This is the secs used to mask a worker unavailable temporarily.
     #[serde(default = "default::batch::mask_worker_temporary_secs")]
     pub mask_worker_temporary_secs: usize,
+
+    /// Keywords on which SQL option redaction is based in the query log.
+    /// A SQL option with a name containing any of these keywords will be redacted.
+    #[serde(default = "default::batch::redact_sql_option_keywords")]
+    pub redact_sql_option_keywords: Vec<String>,
+
+    /// Enable the spill out to disk feature for batch queries.
+    #[serde(default = "default::batch::enable_spill")]
+    pub enable_spill: bool,
 }
 
 /// The section `[streaming]` in `risingwave.toml`.
@@ -618,8 +678,14 @@ pub struct StorageConfig {
     #[serde(default = "default::storage::shared_buffer_flush_ratio")]
     pub shared_buffer_flush_ratio: f32,
 
+    /// The minimum total flush size of shared buffer spill. When a shared buffer spilled is trigger,
+    /// the total flush size across multiple epochs should be at least higher than this size.
+    #[serde(default = "default::storage::shared_buffer_min_batch_flush_size_mb")]
+    pub shared_buffer_min_batch_flush_size_mb: usize,
+
     /// The threshold for the number of immutable memtables to merge to a new imm.
     #[serde(default = "default::storage::imm_merge_threshold")]
+    #[deprecated]
     pub imm_merge_threshold: usize,
 
     /// Whether to enable write conflict detection
@@ -644,6 +710,9 @@ pub struct StorageConfig {
     /// max memory usage for large query
     #[serde(default)]
     pub prefetch_buffer_capacity_mb: Option<usize>,
+
+    #[serde(default)]
+    pub max_cached_recent_versions_number: Option<usize>,
 
     /// max prefetch block number
     #[serde(default = "default::storage::max_prefetch_block_number")]
@@ -674,6 +743,9 @@ pub struct StorageConfig {
     #[serde(default = "default::storage::sstable_id_remote_fetch_number")]
     pub sstable_id_remote_fetch_number: u32,
 
+    #[serde(default = "default::storage::min_sstable_size_mb")]
+    pub min_sstable_size_mb: u32,
+
     #[serde(default)]
     pub data_file_cache: FileCacheConfig,
 
@@ -686,10 +758,6 @@ pub struct StorageConfig {
     /// Whether to enable streaming upload for sstable.
     #[serde(default = "default::storage::min_sst_size_for_streaming_upload")]
     pub min_sst_size_for_streaming_upload: u64,
-
-    /// Max sub compaction task numbers
-    #[serde(default = "default::storage::max_sub_compaction")]
-    pub max_sub_compaction: u32,
 
     #[serde(default = "default::storage::max_concurrent_compaction_task_number")]
     pub max_concurrent_compaction_task_number: u64,
@@ -720,6 +788,10 @@ pub struct StorageConfig {
     #[serde(default = "default::storage::compactor_iter_max_io_retry_times")]
     pub compactor_iter_max_io_retry_times: usize,
 
+    /// The window size of table info statistic history.
+    #[serde(default = "default::storage::table_info_statistic_history_times")]
+    pub table_info_statistic_history_times: usize,
+
     #[serde(default, flatten)]
     #[config_doc(omitted)]
     pub unrecognized: Unrecognized<Self>,
@@ -728,6 +800,14 @@ pub struct StorageConfig {
     #[serde(default = "default::storage::mem_table_spill_threshold")]
     pub mem_table_spill_threshold: usize,
 
+    /// The concurrent uploading number of `SSTables` of buidler
+    #[serde(default = "default::storage::compactor_concurrent_uploading_sst_count")]
+    pub compactor_concurrent_uploading_sst_count: Option<usize>,
+
+    /// Object storage configuration
+    /// 1. General configuration
+    /// 2. Some special configuration of Backend
+    /// 3. Retry and timeout configuration
     #[serde(default)]
     pub object_store: ObjectStoreConfig,
 }
@@ -783,12 +863,6 @@ pub struct FileCacheConfig {
     #[serde(default = "default::file_cache::file_capacity_mb")]
     pub file_capacity_mb: usize,
 
-    #[serde(default = "default::file_cache::device_align")]
-    pub device_align: usize,
-
-    #[serde(default = "default::file_cache::device_io_size")]
-    pub device_io_size: usize,
-
     #[serde(default = "default::file_cache::flushers")]
     pub flushers: usize,
 
@@ -798,20 +872,32 @@ pub struct FileCacheConfig {
     #[serde(default = "default::file_cache::recover_concurrency")]
     pub recover_concurrency: usize,
 
-    #[serde(default = "default::file_cache::lfu_window_to_cache_size_ratio")]
-    pub lfu_window_to_cache_size_ratio: usize,
-
-    #[serde(default = "default::file_cache::lfu_tiny_lru_capacity_ratio")]
-    pub lfu_tiny_lru_capacity_ratio: f64,
-
     #[serde(default = "default::file_cache::insert_rate_limit_mb")]
     pub insert_rate_limit_mb: usize,
 
-    #[serde(default = "default::file_cache::catalog_bits")]
-    pub catalog_bits: usize,
+    #[serde(default = "default::file_cache::indexer_shards")]
+    pub indexer_shards: usize,
 
     #[serde(default = "default::file_cache::compression")]
-    pub compression: String,
+    pub compression: Compression,
+
+    #[serde(default = "default::file_cache::flush_buffer_threshold_mb")]
+    pub flush_buffer_threshold_mb: Option<usize>,
+
+    /// Recover mode.
+    ///
+    /// Options:
+    ///
+    /// - "None": Do not recover disk cache.
+    /// - "Quiet": Recover disk cache and skip errors.
+    /// - "Strict": Recover disk cache and panic on errors.
+    ///
+    /// More details, see [`RecoverMode::None`], [`RecoverMode::Quiet`] and [`RecoverMode::Strict`],
+    #[serde(default = "default::file_cache::recover_mode")]
+    pub recover_mode: RecoverMode,
+
+    #[serde(default = "default::file_cache::runtime_config")]
+    pub runtime_config: RuntimeConfig,
 
     #[serde(default, flatten)]
     #[config_doc(omitted)]
@@ -929,11 +1015,46 @@ pub struct StreamingDeveloperConfig {
     #[serde(default = "default::developer::memory_controller_threshold_stable")]
     pub memory_controller_threshold_stable: f64,
 
+    #[serde(default = "default::developer::memory_controller_eviction_factor_aggressive")]
+    pub memory_controller_eviction_factor_aggressive: f64,
+
+    #[serde(default = "default::developer::memory_controller_eviction_factor_graceful")]
+    pub memory_controller_eviction_factor_graceful: f64,
+
+    #[serde(default = "default::developer::memory_controller_eviction_factor_stable")]
+    pub memory_controller_eviction_factor_stable: f64,
+
+    #[serde(default = "default::developer::memory_controller_sequence_tls_step")]
+    pub memory_controller_sequence_tls_step: u64,
+
+    #[serde(default = "default::developer::memory_controller_sequence_tls_lag")]
+    pub memory_controller_sequence_tls_lag: u64,
+
     #[serde(default = "default::developer::stream_enable_arrangement_backfill")]
     /// Enable arrangement backfill
-    /// If true, the arrangement backfill will be disabled,
+    /// If false, the arrangement backfill will be disabled,
     /// even if session variable set.
+    /// If true, it will be enabled by default, but session variable
+    /// can override it.
     pub enable_arrangement_backfill: bool,
+
+    #[serde(default = "default::developer::stream_high_join_amplification_threshold")]
+    /// If number of hash join matches exceeds this threshold number,
+    /// it will be logged.
+    pub high_join_amplification_threshold: usize,
+
+    /// Actor tokio metrics is enabled if `enable_actor_tokio_metrics` is set or metrics level >= Debug.
+    #[serde(default = "default::developer::enable_actor_tokio_metrics")]
+    pub enable_actor_tokio_metrics: bool,
+
+    /// The number of the connections for streaming remote exchange between two nodes.
+    /// If not specified, the value of `server.connection_pool_size` will be used.
+    #[serde(default = "default::developer::stream_exchange_connection_pool_size")]
+    pub exchange_connection_pool_size: Option<u16>,
+
+    /// A flag to allow disabling the auto schema change handling
+    #[serde(default = "default::developer::stream_enable_auto_schema_change")]
+    pub enable_auto_schema_change: bool,
 }
 
 /// The subsections `[batch.developer]`.
@@ -953,6 +1074,11 @@ pub struct BatchDeveloperConfig {
     /// The size of a chunk produced by `RowSeqScanExecutor`
     #[serde(default = "default::developer::batch_chunk_size")]
     pub chunk_size: usize,
+
+    /// The number of the connections for batch remote exchange between two nodes.
+    /// If not specified, the value of `server.connection_pool_size` will be used.
+    #[serde(default = "default::developer::batch_exchange_connection_pool_size")]
+    exchange_connection_pool_size: Option<u16>,
 }
 
 macro_rules! define_system_config {
@@ -978,37 +1104,67 @@ for_all_params!(define_system_config);
 /// The subsections `[storage.object_store]`.
 #[derive(Clone, Debug, Serialize, Deserialize, DefaultFromSerde)]
 pub struct ObjectStoreConfig {
-    #[serde(default = "default::object_store_config::object_store_set_atomic_write_dir")]
-    pub object_store_set_atomic_write_dir: bool,
+    // alias is for backward compatibility
+    #[serde(
+        default = "default::object_store_config::set_atomic_write_dir",
+        alias = "object_store_set_atomic_write_dir"
+    )]
+    pub set_atomic_write_dir: bool,
 
+    /// Retry and timeout configuration
+    /// Description retry strategy driven by exponential back-off
+    /// Exposes the timeout and retries of each Object store interface. Therefore, the total timeout for each interface is determined based on the interface's timeout/retry configuration and the exponential back-off policy.
     #[serde(default)]
     pub retry: ObjectStoreRetryConfig,
 
+    /// Some special configuration of S3 Backend
     #[serde(default)]
     pub s3: S3ObjectStoreConfig,
+
+    // TODO: the following field will be deprecated after opendal is stablized
+    #[serde(default = "default::object_store_config::opendal_upload_concurrency")]
+    pub opendal_upload_concurrency: usize,
+
+    // TODO: the following field will be deprecated after opendal is stablized
+    #[serde(default)]
+    pub opendal_writer_abort_on_err: bool,
+
+    #[serde(default = "default::object_store_config::upload_part_size")]
+    pub upload_part_size: usize,
 }
 
 impl ObjectStoreConfig {
     pub fn set_atomic_write_dir(&mut self) {
-        self.object_store_set_atomic_write_dir = true;
+        self.set_atomic_write_dir = true;
     }
 }
 
 /// The subsections `[storage.object_store.s3]`.
 #[derive(Clone, Debug, Serialize, Deserialize, DefaultFromSerde)]
 pub struct S3ObjectStoreConfig {
-    #[serde(default = "default::object_store_config::s3::object_store_keepalive_ms")]
-    pub object_store_keepalive_ms: Option<u64>,
-    #[serde(default = "default::object_store_config::s3::object_store_recv_buffer_size")]
-    pub object_store_recv_buffer_size: Option<usize>,
-    #[serde(default = "default::object_store_config::s3::object_store_send_buffer_size")]
-    pub object_store_send_buffer_size: Option<usize>,
-    #[serde(default = "default::object_store_config::s3::object_store_nodelay")]
-    pub object_store_nodelay: Option<bool>,
-    /// For backwards compatibility, users should use `S3ObjectStoreDeveloperConfig` instead.
+    // alias is for backward compatibility
     #[serde(
-        default = "default::object_store_config::s3::developer::object_store_retry_unknown_service_error"
+        default = "default::object_store_config::s3::keepalive_ms",
+        alias = "object_store_keepalive_ms"
     )]
+    pub keepalive_ms: Option<u64>,
+    #[serde(
+        default = "default::object_store_config::s3::recv_buffer_size",
+        alias = "object_store_recv_buffer_size"
+    )]
+    pub recv_buffer_size: Option<usize>,
+    #[serde(
+        default = "default::object_store_config::s3::send_buffer_size",
+        alias = "object_store_send_buffer_size"
+    )]
+    pub send_buffer_size: Option<usize>,
+    #[serde(
+        default = "default::object_store_config::s3::nodelay",
+        alias = "object_store_nodelay"
+    )]
+    pub nodelay: Option<bool>,
+    /// For backwards compatibility, users should use `S3ObjectStoreDeveloperConfig` instead.
+    #[serde(default = "default::object_store_config::s3::developer::retry_unknown_service_error")]
     pub retry_unknown_service_error: bool,
     #[serde(default = "default::object_store_config::s3::identity_resolution_timeout_s")]
     pub identity_resolution_timeout_s: u64,
@@ -1021,82 +1177,108 @@ pub struct S3ObjectStoreConfig {
 pub struct S3ObjectStoreDeveloperConfig {
     /// Whether to retry s3 sdk error from which no error metadata is provided.
     #[serde(
-        default = "default::object_store_config::s3::developer::object_store_retry_unknown_service_error"
+        default = "default::object_store_config::s3::developer::retry_unknown_service_error",
+        alias = "object_store_retry_unknown_service_error"
     )]
-    pub object_store_retry_unknown_service_error: bool,
+    pub retry_unknown_service_error: bool,
     /// An array of error codes that should be retried.
     /// e.g. `["SlowDown", "TooManyRequests"]`
     #[serde(
-        default = "default::object_store_config::s3::developer::object_store_retryable_service_error_codes"
+        default = "default::object_store_config::s3::developer::retryable_service_error_codes",
+        alias = "object_store_retryable_service_error_codes"
     )]
-    pub object_store_retryable_service_error_codes: Vec<String>,
+    pub retryable_service_error_codes: Vec<String>,
 
+    // TODO: deprecate this config when we are completely deprecate aws sdk.
     #[serde(default = "default::object_store_config::s3::developer::use_opendal")]
     pub use_opendal: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, DefaultFromSerde)]
 pub struct ObjectStoreRetryConfig {
+    // A retry strategy driven by exponential back-off.
+    // The retry strategy is used for all object store operations.
+    /// Given a base duration for retry strategy in milliseconds.
     #[serde(default = "default::object_store_config::object_store_req_backoff_interval_ms")]
     pub req_backoff_interval_ms: u64,
+
+    /// The max delay interval for the retry strategy. No retry delay will be longer than this `Duration`.
     #[serde(default = "default::object_store_config::object_store_req_backoff_max_delay_ms")]
     pub req_backoff_max_delay_ms: u64,
+
+    /// A multiplicative factor that will be applied to the exponential back-off retry delay.
     #[serde(default = "default::object_store_config::object_store_req_backoff_factor")]
     pub req_backoff_factor: u64,
 
-    // upload
+    /// Maximum timeout for `upload` operation
     #[serde(default = "default::object_store_config::object_store_upload_attempt_timeout_ms")]
     pub upload_attempt_timeout_ms: u64,
+
+    /// Total counts of `upload` operation retries
     #[serde(default = "default::object_store_config::object_store_upload_retry_attempts")]
     pub upload_retry_attempts: usize,
 
-    // streaming_upload_init + streaming_upload
+    /// Maximum timeout for `streaming_upload_init` and `streaming_upload`
     #[serde(
         default = "default::object_store_config::object_store_streaming_upload_attempt_timeout_ms"
     )]
     pub streaming_upload_attempt_timeout_ms: u64,
+
+    /// Total counts of `streaming_upload` operation retries
     #[serde(
         default = "default::object_store_config::object_store_streaming_upload_retry_attempts"
     )]
     pub streaming_upload_retry_attempts: usize,
 
-    // read
+    /// Maximum timeout for `read` operation
     #[serde(default = "default::object_store_config::object_store_read_attempt_timeout_ms")]
     pub read_attempt_timeout_ms: u64,
+
+    /// Total counts of `read` operation retries
     #[serde(default = "default::object_store_config::object_store_read_retry_attempts")]
     pub read_retry_attempts: usize,
 
-    // streaming_read_init + streaming_read
+    /// Maximum timeout for `streaming_read_init` and `streaming_read` operation
     #[serde(
         default = "default::object_store_config::object_store_streaming_read_attempt_timeout_ms"
     )]
     pub streaming_read_attempt_timeout_ms: u64,
+
+    /// Total counts of `streaming_read operation` retries
     #[serde(default = "default::object_store_config::object_store_streaming_read_retry_attempts")]
     pub streaming_read_retry_attempts: usize,
 
-    // metadata
+    /// Maximum timeout for `metadata` operation
     #[serde(default = "default::object_store_config::object_store_metadata_attempt_timeout_ms")]
     pub metadata_attempt_timeout_ms: u64,
+
+    /// Total counts of `metadata` operation retries
     #[serde(default = "default::object_store_config::object_store_metadata_retry_attempts")]
     pub metadata_retry_attempts: usize,
 
-    // delete
+    /// Maximum timeout for `delete` operation
     #[serde(default = "default::object_store_config::object_store_delete_attempt_timeout_ms")]
     pub delete_attempt_timeout_ms: u64,
+
+    /// Total counts of `delete` operation retries
     #[serde(default = "default::object_store_config::object_store_delete_retry_attempts")]
     pub delete_retry_attempts: usize,
 
-    // delete_object
+    /// Maximum timeout for `delete_object` operation
     #[serde(
         default = "default::object_store_config::object_store_delete_objects_attempt_timeout_ms"
     )]
     pub delete_objects_attempt_timeout_ms: u64,
+
+    /// Total counts of `delete_object` operation retries
     #[serde(default = "default::object_store_config::object_store_delete_objects_retry_attempts")]
     pub delete_objects_retry_attempts: usize,
 
-    // list
+    /// Maximum timeout for `list` operation
     #[serde(default = "default::object_store_config::object_store_list_attempt_timeout_ms")]
     pub list_attempt_timeout_ms: u64,
+
+    /// Total counts of `list` operation retries
     #[serde(default = "default::object_store_config::object_store_list_retry_attempts")]
     pub list_retry_attempts: usize,
 }
@@ -1107,7 +1289,7 @@ impl SystemConfig {
         macro_rules! fields {
             ($({ $field:ident, $($rest:tt)* },)*) => {
                 SystemParams {
-                    $($field: self.$field,)*
+                    $($field: self.$field.map(Into::into),)*
                     ..Default::default() // deprecated fields
                 }
             };
@@ -1136,6 +1318,30 @@ impl SystemConfig {
     }
 }
 
+impl RwConfig {
+    pub const fn default_connection_pool_size(&self) -> u16 {
+        self.server.connection_pool_size
+    }
+
+    /// Returns [`StreamingDeveloperConfig::exchange_connection_pool_size`] if set,
+    /// otherwise [`ServerConfig::connection_pool_size`].
+    pub fn streaming_exchange_connection_pool_size(&self) -> u16 {
+        self.streaming
+            .developer
+            .exchange_connection_pool_size
+            .unwrap_or_else(|| self.default_connection_pool_size())
+    }
+
+    /// Returns [`BatchDeveloperConfig::exchange_connection_pool_size`] if set,
+    /// otherwise [`ServerConfig::connection_pool_size`].
+    pub fn batch_exchange_connection_pool_size(&self) -> u16 {
+        self.batch
+            .developer
+            .exchange_connection_pool_size
+            .unwrap_or_else(|| self.default_connection_pool_size())
+    }
+}
+
 pub mod default {
     pub mod meta {
         use crate::config::{DefaultParallelism, MetaBackend};
@@ -1146,6 +1352,10 @@ pub mod default {
 
         pub fn full_gc_interval_sec() -> u64 {
             86400
+        }
+
+        pub fn full_gc_object_limit() -> u64 {
+            100_000
         }
 
         pub fn collect_gc_watermark_spin_interval_sec() -> u64 {
@@ -1161,7 +1371,7 @@ pub mod default {
         }
 
         pub fn vacuum_spin_interval_ms() -> u64 {
-            10
+            200
         }
 
         pub fn hummock_version_checkpoint_interval_sec() -> u64 {
@@ -1170,6 +1380,10 @@ pub mod default {
 
         pub fn enable_hummock_data_archive() -> bool {
             false
+        }
+
+        pub fn hummock_time_travel_snapshot_interval() -> u64 {
+            100
         }
 
         pub fn min_delta_log_num_for_hummock_version_checkpoint() -> u64 {
@@ -1204,7 +1418,7 @@ pub mod default {
             1800 // 30mi
         }
 
-        pub fn periodic_split_compact_group_interval_sec() -> u64 {
+        pub fn periodic_scheduling_compaction_group_interval_sec() -> u64 {
             10 // 10s
         }
 
@@ -1244,8 +1458,16 @@ pub mod default {
             1024 * 1024 * 1024 // 1GB
         }
 
-        pub fn hybird_partition_vnode_count() -> u32 {
+        pub fn hybrid_partition_vnode_count() -> u32 {
             4
+        }
+
+        pub fn compact_task_table_size_partition_threshold_low() -> u64 {
+            128 * 1024 * 1024 // 128MB
+        }
+
+        pub fn compact_task_table_size_partition_threshold_high() -> u64 {
+            512 * 1024 * 1024 // 512MB
         }
 
         pub fn event_log_enabled() -> bool {
@@ -1267,6 +1489,7 @@ pub mod default {
         pub fn parallelism_control_trigger_first_delay_sec() -> u64 {
             30
         }
+
         pub fn enable_dropped_column_reclaim() -> bool {
             false
         }
@@ -1311,6 +1534,10 @@ pub mod default {
 
         pub fn shared_buffer_flush_ratio() -> f32 {
             0.8
+        }
+
+        pub fn shared_buffer_min_batch_flush_size_mb() -> usize {
+            800
         }
 
         pub fn imm_merge_threshold() -> usize {
@@ -1385,13 +1612,13 @@ pub mod default {
             10
         }
 
+        pub fn min_sstable_size_mb() -> u32 {
+            32
+        }
+
         pub fn min_sst_size_for_streaming_upload() -> u64 {
             // 32MB
             32 * 1024 * 1024
-        }
-
-        pub fn max_sub_compaction() -> u32 {
-            4
         }
 
         pub fn max_concurrent_compaction_task_number() -> u64 {
@@ -1433,6 +1660,7 @@ pub mod default {
         pub fn max_preload_io_retry_times() -> usize {
             3
         }
+
         pub fn mem_table_spill_threshold() -> usize {
             4 << 20
         }
@@ -1447,6 +1675,22 @@ pub mod default {
 
         pub fn max_prefetch_block_number() -> usize {
             16
+        }
+
+        pub fn compactor_concurrent_uploading_sst_count() -> Option<usize> {
+            None
+        }
+
+        pub fn table_info_statistic_history_times() -> usize {
+            240
+        }
+
+        pub fn block_file_cache_flush_buffer_threshold_mb() -> usize {
+            256
+        }
+
+        pub fn meta_file_cache_flush_buffer_threshold_mb() -> usize {
+            64
         }
     }
 
@@ -1473,6 +1717,7 @@ pub mod default {
     }
 
     pub mod file_cache {
+        use foyer::{Compression, RecoverMode, RuntimeConfig, TokioRuntimeConfig};
 
         pub fn dir() -> String {
             "".to_string()
@@ -1484,14 +1729,6 @@ pub mod default {
 
         pub fn file_capacity_mb() -> usize {
             64
-        }
-
-        pub fn device_align() -> usize {
-            4096
-        }
-
-        pub fn device_io_size() -> usize {
-            16 * 1024
         }
 
         pub fn flushers() -> usize {
@@ -1506,24 +1743,28 @@ pub mod default {
             8
         }
 
-        pub fn lfu_window_to_cache_size_ratio() -> usize {
-            1
-        }
-
-        pub fn lfu_tiny_lru_capacity_ratio() -> f64 {
-            0.01
-        }
-
         pub fn insert_rate_limit_mb() -> usize {
             0
         }
 
-        pub fn catalog_bits() -> usize {
-            6
+        pub fn indexer_shards() -> usize {
+            64
         }
 
-        pub fn compression() -> String {
-            "none".to_string()
+        pub fn compression() -> Compression {
+            Compression::None
+        }
+
+        pub fn flush_buffer_threshold_mb() -> Option<usize> {
+            None
+        }
+
+        pub fn recover_mode() -> RecoverMode {
+            RecoverMode::None
+        }
+
+        pub fn runtime_config() -> RuntimeConfig {
+            RuntimeConfig::Unified(TokioRuntimeConfig::default())
         }
     }
 
@@ -1588,6 +1829,12 @@ pub mod default {
             1024
         }
 
+        /// Default to unset to be compatible with the behavior before this config is introduced,
+        /// that is, follow the value of `server.connection_pool_size`.
+        pub fn batch_exchange_connection_pool_size() -> Option<u16> {
+            None
+        }
+
         pub fn stream_enable_executor_row_count() -> bool {
             false
         }
@@ -1644,16 +1891,68 @@ pub mod default {
             5
         }
 
+        pub fn actor_cnt_per_worker_parallelism_soft_limit() -> usize {
+            100
+        }
+
+        pub fn actor_cnt_per_worker_parallelism_hard_limit() -> usize {
+            400
+        }
+
+        pub fn hummock_time_travel_sst_info_fetch_batch_size() -> usize {
+            10_000
+        }
+
         pub fn memory_controller_threshold_aggressive() -> f64 {
             0.9
         }
+
         pub fn memory_controller_threshold_graceful() -> f64 {
-            0.8
+            0.81
         }
+
         pub fn memory_controller_threshold_stable() -> f64 {
-            0.7
+            0.72
         }
+
+        pub fn memory_controller_eviction_factor_aggressive() -> f64 {
+            2.0
+        }
+
+        pub fn memory_controller_eviction_factor_graceful() -> f64 {
+            1.5
+        }
+
+        pub fn memory_controller_eviction_factor_stable() -> f64 {
+            1.0
+        }
+
+        pub fn memory_controller_sequence_tls_step() -> u64 {
+            128
+        }
+
+        pub fn memory_controller_sequence_tls_lag() -> u64 {
+            32
+        }
+
         pub fn stream_enable_arrangement_backfill() -> bool {
+            true
+        }
+
+        pub fn stream_high_join_amplification_threshold() -> usize {
+            2048
+        }
+
+        /// Default to 1 to be compatible with the behavior before this config is introduced.
+        pub fn stream_exchange_connection_pool_size() -> Option<u16> {
+            Some(1)
+        }
+
+        pub fn enable_actor_tokio_metrics() -> bool {
+            false
+        }
+
+        pub fn stream_enable_auto_schema_change() -> bool {
             true
         }
     }
@@ -1663,6 +1962,10 @@ pub mod default {
     pub mod batch {
         pub fn enable_barrier_read() -> bool {
             false
+        }
+
+        pub fn enable_spill() -> bool {
+            true
         }
 
         pub fn statement_timeout_in_sec() -> u32 {
@@ -1677,73 +1980,118 @@ pub mod default {
         pub fn mask_worker_temporary_secs() -> usize {
             30
         }
+
+        pub fn redact_sql_option_keywords() -> Vec<String> {
+            [
+                "credential",
+                "key",
+                "password",
+                "private",
+                "secret",
+                "token",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        }
     }
 
     pub mod compaction_config {
-        const DEFAULT_MAX_COMPACTION_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2GB
-        const DEFAULT_MIN_COMPACTION_BYTES: u64 = 128 * 1024 * 1024; // 128MB
-        const DEFAULT_MAX_BYTES_FOR_LEVEL_BASE: u64 = 512 * 1024 * 1024; // 512MB
+        const MB: u64 = 1024 * 1024;
+        const GB: u64 = 1024 * 1024 * 1024;
+        const DEFAULT_MAX_COMPACTION_BYTES: u64 = 2 * GB; // 2GB
+        const DEFAULT_MIN_COMPACTION_BYTES: u64 = 128 * MB; // 128MB
+        const DEFAULT_MAX_BYTES_FOR_LEVEL_BASE: u64 = 512 * MB; // 512MB
 
         // decrease this configure when the generation of checkpoint barrier is not frequent.
         const DEFAULT_TIER_COMPACT_TRIGGER_NUMBER: u64 = 12;
-        const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 32 * 1024 * 1024; // 32MB
+        const DEFAULT_TARGET_FILE_SIZE_BASE: u64 = 32 * MB;
+        // 32MB
         const DEFAULT_MAX_SUB_COMPACTION: u32 = 4;
         const DEFAULT_LEVEL_MULTIPLIER: u64 = 5;
-        const DEFAULT_MAX_SPACE_RECLAIM_BYTES: u64 = 512 * 1024 * 1024; // 512MB;
+        const DEFAULT_MAX_SPACE_RECLAIM_BYTES: u64 = 512 * MB; // 512MB;
         const DEFAULT_LEVEL0_STOP_WRITE_THRESHOLD_SUB_LEVEL_NUMBER: u64 = 300;
         const DEFAULT_MAX_COMPACTION_FILE_COUNT: u64 = 100;
         const DEFAULT_MIN_SUB_LEVEL_COMPACT_LEVEL_COUNT: u32 = 3;
         const DEFAULT_MIN_OVERLAPPING_SUB_LEVEL_COMPACT_LEVEL_COUNT: u32 = 12;
         const DEFAULT_TOMBSTONE_RATIO_PERCENT: u32 = 40;
         const DEFAULT_EMERGENCY_PICKER: bool = true;
+        const DEFAULT_MAX_LEVEL: u32 = 6;
+        const DEFAULT_MAX_L0_COMPACT_LEVEL_COUNT: u32 = 42;
+        const DEFAULT_SST_ALLOWED_TRIVIAL_MOVE_MIN_SIZE: u64 = 4 * MB;
 
         use crate::catalog::hummock::CompactionFilterFlag;
 
         pub fn max_bytes_for_level_base() -> u64 {
             DEFAULT_MAX_BYTES_FOR_LEVEL_BASE
         }
+
         pub fn max_bytes_for_level_multiplier() -> u64 {
             DEFAULT_LEVEL_MULTIPLIER
         }
+
         pub fn max_compaction_bytes() -> u64 {
             DEFAULT_MAX_COMPACTION_BYTES
         }
+
         pub fn sub_level_max_compaction_bytes() -> u64 {
             DEFAULT_MIN_COMPACTION_BYTES
         }
+
         pub fn level0_tier_compact_file_number() -> u64 {
             DEFAULT_TIER_COMPACT_TRIGGER_NUMBER
         }
+
         pub fn target_file_size_base() -> u64 {
             DEFAULT_TARGET_FILE_SIZE_BASE
         }
+
         pub fn compaction_filter_mask() -> u32 {
             (CompactionFilterFlag::STATE_CLEAN | CompactionFilterFlag::TTL).into()
         }
+
         pub fn max_sub_compaction() -> u32 {
             DEFAULT_MAX_SUB_COMPACTION
         }
+
         pub fn level0_stop_write_threshold_sub_level_number() -> u64 {
             DEFAULT_LEVEL0_STOP_WRITE_THRESHOLD_SUB_LEVEL_NUMBER
         }
+
         pub fn level0_sub_level_compact_level_count() -> u32 {
             DEFAULT_MIN_SUB_LEVEL_COMPACT_LEVEL_COUNT
         }
+
         pub fn level0_overlapping_sub_level_compact_level_count() -> u32 {
             DEFAULT_MIN_OVERLAPPING_SUB_LEVEL_COMPACT_LEVEL_COUNT
         }
+
         pub fn max_space_reclaim_bytes() -> u64 {
             DEFAULT_MAX_SPACE_RECLAIM_BYTES
         }
+
         pub fn level0_max_compact_file_number() -> u64 {
             DEFAULT_MAX_COMPACTION_FILE_COUNT
         }
+
         pub fn tombstone_reclaim_ratio() -> u32 {
             DEFAULT_TOMBSTONE_RATIO_PERCENT
         }
 
         pub fn enable_emergency_picker() -> bool {
             DEFAULT_EMERGENCY_PICKER
+        }
+
+        pub fn max_level() -> u32 {
+            DEFAULT_MAX_LEVEL
+        }
+
+        pub fn max_l0_compact_level_count() -> u32 {
+            DEFAULT_MAX_L0_COMPACT_LEVEL_COUNT
+        }
+
+        pub fn sst_allowed_trivial_move_min_size() -> u64 {
+            DEFAULT_SST_ALLOWED_TRIVIAL_MOVE_MIN_SIZE
         }
     }
 
@@ -1752,7 +2100,7 @@ pub mod default {
         const DEFAULT_REQ_BACKOFF_MAX_DELAY_MS: u64 = 10 * 1000; // 10s
         const DEFAULT_REQ_MAX_RETRY_ATTEMPTS: usize = 3;
 
-        pub fn object_store_set_atomic_write_dir() -> bool {
+        pub fn set_atomic_write_dir() -> bool {
             false
         }
 
@@ -1835,24 +2183,33 @@ pub mod default {
             DEFAULT_REQ_MAX_RETRY_ATTEMPTS
         }
 
+        pub fn opendal_upload_concurrency() -> usize {
+            256
+        }
+
+        pub fn upload_part_size() -> usize {
+            // 16m
+            16 * 1024 * 1024
+        }
+
         pub mod s3 {
             const DEFAULT_IDENTITY_RESOLUTION_TIMEOUT_S: u64 = 5;
 
             const DEFAULT_KEEPALIVE_MS: u64 = 600 * 1000; // 10min
 
-            pub fn object_store_keepalive_ms() -> Option<u64> {
+            pub fn keepalive_ms() -> Option<u64> {
                 Some(DEFAULT_KEEPALIVE_MS) // 10min
             }
 
-            pub fn object_store_recv_buffer_size() -> Option<usize> {
+            pub fn recv_buffer_size() -> Option<usize> {
                 Some(1 << 21) // 2m
             }
 
-            pub fn object_store_send_buffer_size() -> Option<usize> {
+            pub fn send_buffer_size() -> Option<usize> {
                 None
             }
 
-            pub fn object_store_nodelay() -> Option<bool> {
+            pub fn nodelay() -> Option<bool> {
                 Some(true)
             }
 
@@ -1861,23 +2218,16 @@ pub mod default {
             }
 
             pub mod developer {
-                use crate::util::env_var::env_var_is_true_or;
-                const RW_USE_OPENDAL_FOR_S3: &str = "RW_USE_OPENDAL_FOR_S3";
-
-                pub fn object_store_retry_unknown_service_error() -> bool {
+                pub fn retry_unknown_service_error() -> bool {
                     false
                 }
 
-                pub fn object_store_retryable_service_error_codes() -> Vec<String> {
+                pub fn retryable_service_error_codes() -> Vec<String> {
                     vec!["SlowDown".into(), "TooManyRequests".into()]
                 }
 
                 pub fn use_opendal() -> bool {
-                    // TODO: deprecate this config when we are completely switch from aws sdk to opendal.
-                    // The reason why we use !env_var_is_false_or(RW_USE_OPENDAL_FOR_S3, false) here is
-                    // 1. Maintain compatibility so that there is no behavior change in cluster with RW_USE_OPENDAL_FOR_S3 set.
-                    // 2. Change the default behavior to use opendal for s3 if RW_USE_OPENDAL_FOR_S3 is not set.
-                    env_var_is_true_or(RW_USE_OPENDAL_FOR_S3, false)
+                    true
                 }
             }
         }
@@ -1919,6 +2269,8 @@ pub struct StorageMemoryConfig {
     pub prefetch_buffer_capacity_mb: usize,
     pub block_cache_eviction_config: EvictionConfig,
     pub meta_cache_eviction_config: EvictionConfig,
+    pub block_file_cache_flush_buffer_threshold_mb: usize,
+    pub meta_file_cache_flush_buffer_threshold_mb: usize,
 }
 
 pub const MAX_META_CACHE_SHARD_BITS: usize = 4;
@@ -2030,6 +2382,17 @@ pub fn extract_storage_memory_config(s: &RwConfig) -> StorageMemoryConfig {
                 }
             });
 
+    let block_file_cache_flush_buffer_threshold_mb = s
+        .storage
+        .data_file_cache
+        .flush_buffer_threshold_mb
+        .unwrap_or(default::storage::block_file_cache_flush_buffer_threshold_mb());
+    let meta_file_cache_flush_buffer_threshold_mb = s
+        .storage
+        .meta_file_cache
+        .flush_buffer_threshold_mb
+        .unwrap_or(default::storage::block_file_cache_flush_buffer_threshold_mb());
+
     StorageMemoryConfig {
         block_cache_capacity_mb,
         block_cache_shard_num,
@@ -2040,6 +2403,8 @@ pub fn extract_storage_memory_config(s: &RwConfig) -> StorageMemoryConfig {
         prefetch_buffer_capacity_mb,
         block_cache_eviction_config,
         meta_cache_eviction_config,
+        block_file_cache_flush_buffer_threshold_mb,
+        meta_file_cache_flush_buffer_threshold_mb,
     }
 }
 
@@ -2077,13 +2442,22 @@ pub struct CompactionConfig {
     pub tombstone_reclaim_ratio: u32,
     #[serde(default = "default::compaction_config::enable_emergency_picker")]
     pub enable_emergency_picker: bool,
+    #[serde(default = "default::compaction_config::max_level")]
+    pub max_level: u32,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use risingwave_license::LicenseKey;
 
     use super::*;
+
+    fn default_config_for_docs() -> RwConfig {
+        let mut config = RwConfig::default();
+        // Set `license_key` to empty in the docs to avoid any confusion.
+        config.system.license_key = Some(LicenseKey::empty());
+        config
+    }
 
     /// This test ensures that `config/example.toml` is up-to-date with the default values specified
     /// in this file. Developer should run `./risedev generate-example-config` to update it if this
@@ -2094,7 +2468,7 @@ mod tests {
 # Check detailed comments in src/common/src/config.rs";
 
         let actual = expect_test::expect_file!["../../config/example.toml"];
-        let default = toml::to_string(&RwConfig::default()).expect("failed to serialize");
+        let default = toml::to_string(&default_config_for_docs()).expect("failed to serialize");
 
         let expected = format!("{HEADER}\n\n{default}");
         actual.assert_eq(&expected);
@@ -2135,7 +2509,7 @@ mod tests {
             .collect();
 
         let toml_doc: BTreeMap<String, toml::Value> =
-            toml::from_str(&toml::to_string(&RwConfig::default()).unwrap()).unwrap();
+            toml::from_str(&toml::to_string(&default_config_for_docs()).unwrap()).unwrap();
         toml_doc.into_iter().for_each(|(name, value)| {
             set_default_values("".to_string(), name, value, &mut configs);
         });
@@ -2181,6 +2555,122 @@ mod tests {
             if let Some(item_doc) = t.get_mut(&name) {
                 item_doc.default = format!("{}", value);
             }
+        }
+    }
+
+    #[test]
+    fn test_object_store_configs_backward_compatibility() {
+        // Define configs with the old name and make sure it still works
+        {
+            let config: RwConfig = toml::from_str(
+                r#"
+            [storage.object_store]
+            object_store_set_atomic_write_dir = true
+
+            [storage.object_store.s3]
+            object_store_keepalive_ms = 1
+            object_store_send_buffer_size = 1
+            object_store_recv_buffer_size = 1
+            object_store_nodelay = false
+
+            [storage.object_store.s3.developer]
+            object_store_retry_unknown_service_error = true
+            object_store_retryable_service_error_codes = ['dummy']
+
+
+            "#,
+            )
+            .unwrap();
+
+            assert!(config.storage.object_store.set_atomic_write_dir);
+            assert_eq!(config.storage.object_store.s3.keepalive_ms, Some(1));
+            assert_eq!(config.storage.object_store.s3.send_buffer_size, Some(1));
+            assert_eq!(config.storage.object_store.s3.recv_buffer_size, Some(1));
+            assert_eq!(config.storage.object_store.s3.nodelay, Some(false));
+            assert!(
+                config
+                    .storage
+                    .object_store
+                    .s3
+                    .developer
+                    .retry_unknown_service_error
+            );
+            assert_eq!(
+                config
+                    .storage
+                    .object_store
+                    .s3
+                    .developer
+                    .retryable_service_error_codes,
+                vec!["dummy".to_string()]
+            );
+        }
+
+        // Define configs with the new name and make sure it works
+        {
+            let config: RwConfig = toml::from_str(
+                r#"
+            [storage.object_store]
+            set_atomic_write_dir = true
+
+            [storage.object_store.s3]
+            keepalive_ms = 1
+            send_buffer_size = 1
+            recv_buffer_size = 1
+            nodelay = false
+
+            [storage.object_store.s3.developer]
+            retry_unknown_service_error = true
+            retryable_service_error_codes = ['dummy']
+
+
+            "#,
+            )
+            .unwrap();
+
+            assert!(config.storage.object_store.set_atomic_write_dir);
+            assert_eq!(config.storage.object_store.s3.keepalive_ms, Some(1));
+            assert_eq!(config.storage.object_store.s3.send_buffer_size, Some(1));
+            assert_eq!(config.storage.object_store.s3.recv_buffer_size, Some(1));
+            assert_eq!(config.storage.object_store.s3.nodelay, Some(false));
+            assert!(
+                config
+                    .storage
+                    .object_store
+                    .s3
+                    .developer
+                    .retry_unknown_service_error
+            );
+            assert_eq!(
+                config
+                    .storage
+                    .object_store
+                    .s3
+                    .developer
+                    .retryable_service_error_codes,
+                vec!["dummy".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn test_meta_configs_backward_compatibility() {
+        // Test periodic_space_reclaim_compaction_interval_sec
+        {
+            let config: RwConfig = toml::from_str(
+                r#"
+            [meta]
+            periodic_split_compact_group_interval_sec = 1
+            "#,
+            )
+            .unwrap();
+
+            assert_eq!(
+                config
+                    .meta
+                    .periodic_scheduling_compaction_group_interval_sec,
+                1
+            );
         }
     }
 }

@@ -20,12 +20,13 @@ use pretty_xmlish::Pretty;
 use risingwave_common::catalog::{Field, Schema, TableDesc};
 use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::ColumnOrder;
+use risingwave_hummock_sdk::HummockVersionId;
 
 use crate::catalog::ColumnId;
 use crate::optimizer::optimizer_context::OptimizerContextRef;
 
 const OP_NAME: &str = "op";
-const OP_TYPE: DataType = DataType::Int16;
+const OP_TYPE: DataType = DataType::Varchar;
 
 #[derive(Debug, Clone, Educe)]
 #[educe(PartialEq, Eq, Hash)]
@@ -44,6 +45,7 @@ pub struct LogScan {
 
     pub old_epoch: u64,
     pub new_epoch: u64,
+    pub version_id: HummockVersionId,
 }
 
 impl LogScan {
@@ -101,6 +103,7 @@ impl LogScan {
         ctx: OptimizerContextRef,
         old_epoch: u64,
         new_epoch: u64,
+        version_id: HummockVersionId,
     ) -> Self {
         Self {
             table_name,
@@ -110,6 +113,7 @@ impl LogScan {
             ctx,
             old_epoch,
             new_epoch,
+            version_id,
         }
     }
 
@@ -138,6 +142,19 @@ impl LogScan {
             OP_TYPE,
             format!("{}.{}", &self.table_name, OP_NAME),
         ));
+        Schema { fields }
+    }
+
+    pub(crate) fn schema_without_table_name(&self) -> Schema {
+        let mut fields: Vec<_> = self
+            .output_col_idx
+            .iter()
+            .map(|tb_idx| {
+                let col = &self.table_desc.columns[*tb_idx];
+                Field::from(col)
+            })
+            .collect();
+        fields.push(Field::with_name(OP_TYPE, OP_NAME));
         Schema { fields }
     }
 

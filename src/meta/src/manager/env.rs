@@ -20,9 +20,12 @@ use risingwave_common::config::{
 };
 use risingwave_common::session_config::SessionConfig;
 use risingwave_common::system_param::reader::SystemParamsReader;
+use risingwave_meta_model_migration::{MigrationStatus, Migrator, MigratorTrait};
 use risingwave_meta_model_v2::prelude::Cluster;
 use risingwave_pb::meta::SystemParams;
-use risingwave_rpc_client::{StreamClientPool, StreamClientPoolRef};
+use risingwave_rpc_client::{
+    FrontendClientPool, FrontendClientPoolRef, StreamClientPool, StreamClientPoolRef,
+};
 use sea_orm::EntityTrait;
 
 use super::{
@@ -35,7 +38,7 @@ use crate::controller::session_params::{SessionParamsController, SessionParamsCo
 use crate::controller::system_param::{SystemParamsController, SystemParamsControllerRef};
 use crate::controller::SqlMetaStore;
 use crate::hummock::sequence::SequenceGenerator;
-use crate::manager::event_log::{start_event_log_manager, EventLogMangerRef};
+use crate::manager::event_log::{start_event_log_manager, EventLogManagerRef};
 use crate::manager::{
     IdGeneratorManager, IdGeneratorManagerRef, IdleManager, IdleManagerRef, NotificationManager,
     NotificationManagerRef,
@@ -122,10 +125,13 @@ pub struct MetaSrvEnv {
     /// stream client pool memorization.
     stream_client_pool: StreamClientPoolRef,
 
+    /// rpc client pool for frontend nodes.
+    frontend_client_pool: FrontendClientPoolRef,
+
     /// idle status manager.
     idle_manager: IdleManagerRef,
 
-    event_log_manager: EventLogMangerRef,
+    event_log_manager: EventLogManagerRef,
 
     /// Unique identifier of the cluster.
     cluster_id: ClusterId,
@@ -169,6 +175,8 @@ pub struct MetaOpts {
     /// Interval of hummock version checkpoint.
     pub hummock_version_checkpoint_interval_sec: u64,
     pub enable_hummock_data_archive: bool,
+    pub hummock_time_travel_snapshot_interval: u64,
+    pub hummock_time_travel_sst_info_fetch_batch_size: usize,
     /// The minimum delta log number a new checkpoint should compact, otherwise the checkpoint
     /// attempt is rejected. Greater value reduces object store IO, meanwhile it results in
     /// more loss of in memory `HummockVersionCheckpoint::stale_objects` state when meta node is
@@ -179,6 +187,8 @@ pub struct MetaOpts {
     pub min_sst_retention_time_sec: u64,
     /// Interval of automatic hummock full GC.
     pub full_gc_interval_sec: u64,
+    /// Max number of object per full GC job can fetch.
+    pub full_gc_object_limit: u64,
     /// The spin interval when collecting global GC watermark in hummock
     pub collect_gc_watermark_spin_interval_sec: u64,
     /// Enable sanity check when SSTs are committed
@@ -192,7 +202,7 @@ pub struct MetaOpts {
     /// The Dashboard service uses this in the following ways:
     /// 1. Query Prometheus for relevant metrics to find Stream Graph Bottleneck, and display it.
     /// 2. Provide cluster diagnostics, at `/api/monitor/diagnose` to troubleshoot cluster.
-    /// These are just examples which show how the Meta Dashboard Service queries Prometheus.
+    ///    These are just examples which show how the Meta Dashboard Service queries Prometheus.
     pub prometheus_endpoint: Option<String>,
 
     /// The additional selector used when querying Prometheus.
@@ -220,8 +230,8 @@ pub struct MetaOpts {
     /// Schedule `tombstone_reclaim_compaction` for all compaction groups with this interval.
     pub periodic_tombstone_reclaim_compaction_interval_sec: u64,
 
-    /// Schedule `split_compaction_group` for all compaction groups with this interval.
-    pub periodic_split_compact_group_interval_sec: u64,
+    /// Schedule `periodic_scheduling_compaction_group_interval_sec` for all compaction groups with this interval.
+    pub periodic_scheduling_compaction_group_interval_sec: u64,
 
     /// The size limit to split a large compaction group.
     pub split_group_size_limit: u64,
@@ -242,17 +252,14 @@ pub struct MetaOpts {
     pub compaction_task_max_progress_interval_secs: u64,
     pub compaction_config: Option<CompactionConfig>,
 
-    /// The size limit to split a state-table to independent sstable.
-    pub cut_table_size_limit: u64,
-
     /// hybird compaction group config
     ///
-    /// `hybird_partition_vnode_count` determines the granularity of vnodes in the hybrid compaction group for SST alignment.
-    /// When `hybird_partition_vnode_count` > 0, in hybrid compaction group
+    /// `hybrid_partition_vnode_count` determines the granularity of vnodes in the hybrid compaction group for SST alignment.
+    /// When `hybrid_partition_vnode_count` > 0, in hybrid compaction group
     /// - Tables with high write throughput will be split at vnode granularity
     /// - Tables with high size tables will be split by table granularity
-    /// When `hybird_partition_vnode_count` = 0,no longer be special alignment operations for the hybird compaction group
-    pub hybird_partition_vnode_count: u32,
+    ///   When `hybrid_partition_vnode_count` = 0,no longer be special alignment operations for the hybird compaction group
+    pub hybrid_partition_node_count: u32,
 
     pub event_log_enabled: bool,
     pub event_log_channel_max_size: u32,
@@ -275,8 +282,22 @@ pub struct MetaOpts {
     /// The maximum number of trivial move tasks to be picked in a single loop
     pub max_trivial_move_task_count_per_loop: usize,
 
-    /// The maximum number of times to probe for PullTaskEvent
+    /// The maximum number of times to probe for `PullTaskEvent`
     pub max_get_task_probe_times: usize,
+
+    pub compact_task_table_size_partition_threshold_low: u64,
+    pub compact_task_table_size_partition_threshold_high: u64,
+
+    // The private key for the secret store, used when the secret is stored in the meta.
+    pub secret_store_private_key: Option<Vec<u8>>,
+    /// The path of the temp secret file directory.
+    pub temp_secret_file_dir: String,
+
+    pub table_info_statistic_history_times: usize,
+
+    // Cluster limits
+    pub actor_cnt_per_worker_parallelism_hard_limit: usize,
+    pub actor_cnt_per_worker_parallelism_soft_limit: usize,
 }
 
 impl MetaOpts {
@@ -296,9 +317,12 @@ impl MetaOpts {
             vacuum_spin_interval_ms: 0,
             hummock_version_checkpoint_interval_sec: 30,
             enable_hummock_data_archive: false,
+            hummock_time_travel_snapshot_interval: 0,
+            hummock_time_travel_sst_info_fetch_batch_size: 10_000,
             min_delta_log_num_for_hummock_version_checkpoint: 1,
             min_sst_retention_time_sec: 3600 * 24 * 7,
             full_gc_interval_sec: 3600 * 24 * 7,
+            full_gc_object_limit: 100_000,
             collect_gc_watermark_spin_interval_sec: 5,
             enable_committed_sst_sanity_check: false,
             periodic_compaction_interval_sec: 60,
@@ -312,9 +336,11 @@ impl MetaOpts {
             telemetry_enabled: false,
             periodic_ttl_reclaim_compaction_interval_sec: 60,
             periodic_tombstone_reclaim_compaction_interval_sec: 60,
-            periodic_split_compact_group_interval_sec: 60,
+            periodic_scheduling_compaction_group_interval_sec: 60,
             split_group_size_limit: 5 * 1024 * 1024 * 1024,
             min_table_split_size: 2 * 1024 * 1024 * 1024,
+            compact_task_table_size_partition_threshold_low: 128 * 1024 * 1024,
+            compact_task_table_size_partition_threshold_high: 512 * 1024 * 1024,
             table_write_throughput_threshold: 128 * 1024 * 1024,
             min_table_split_write_throughput: 64 * 1024 * 1024,
             do_not_config_object_storage_lifecycle: true,
@@ -322,8 +348,7 @@ impl MetaOpts {
             compaction_task_max_heartbeat_interval_secs: 0,
             compaction_task_max_progress_interval_secs: 1,
             compaction_config: None,
-            cut_table_size_limit: 1024 * 1024 * 1024,
-            hybird_partition_vnode_count: 4,
+            hybrid_partition_node_count: 4,
             event_log_enabled: false,
             event_log_channel_max_size: 1,
             advertise_addr: "".to_string(),
@@ -335,21 +360,44 @@ impl MetaOpts {
             object_store_config: ObjectStoreConfig::default(),
             max_trivial_move_task_count_per_loop: 256,
             max_get_task_probe_times: 5,
+            secret_store_private_key: Some("0123456789abcdef".as_bytes().to_vec()),
+            temp_secret_file_dir: "./secrets".to_string(),
+            table_info_statistic_history_times: 240,
+            actor_cnt_per_worker_parallelism_hard_limit: usize::MAX,
+            actor_cnt_per_worker_parallelism_soft_limit: usize::MAX,
         }
     }
+}
+
+/// This function `is_first_launch_for_sql_backend_cluster` is used to check whether the cluster, which uses SQL as the backend, is a new cluster.
+/// It determines this by inspecting the applied migrations. If the migration `m20230908_072257_init` has been applied,
+/// then it is considered an old cluster.
+///
+/// Note: this check should be performed before `Migrator::up()`.
+pub async fn is_first_launch_for_sql_backend_cluster(
+    sql_meta_store: &SqlMetaStore,
+) -> MetaResult<bool> {
+    let migrations = Migrator::get_applied_migrations(&sql_meta_store.conn).await?;
+    for migration in migrations {
+        if migration.name() == "m20230908_072257_init"
+            && migration.status() == MigrationStatus::Applied
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl MetaSrvEnv {
     pub async fn new(
         opts: MetaOpts,
-        init_system_params: SystemParams,
+        mut init_system_params: SystemParams,
         init_session_config: SessionConfig,
         meta_store_impl: MetaStoreImpl,
     ) -> MetaResult<Self> {
-        let notification_manager =
-            Arc::new(NotificationManager::new(meta_store_impl.clone()).await);
         let idle_manager = Arc::new(IdleManager::new(opts.max_idle_ms));
-        let stream_client_pool = Arc::new(StreamClientPool::default());
+        let stream_client_pool = Arc::new(StreamClientPool::new(1)); // typically no need for plural clients
+        let frontend_client_pool = Arc::new(FrontendClientPool::new(1));
         let event_log_manager = Arc::new(start_event_log_manager(
             opts.event_log_enabled,
             opts.event_log_channel_max_size,
@@ -357,6 +405,8 @@ impl MetaSrvEnv {
 
         let env = match &meta_store_impl {
             MetaStoreImpl::Kv(meta_store) => {
+                let notification_manager =
+                    Arc::new(NotificationManager::new(meta_store_impl.clone()).await);
                 let id_gen_manager = Arc::new(IdGeneratorManager::new(meta_store.clone()).await);
                 let (cluster_id, cluster_first_launch) =
                     if let Some(id) = ClusterId::from_meta_store(meta_store).await? {
@@ -364,6 +414,13 @@ impl MetaSrvEnv {
                     } else {
                         (ClusterId::new(), true)
                     };
+
+                // For new clusters:
+                // - the name of the object store needs to be prefixed according to the object id.
+                //
+                // For old clusters
+                // - the prefix is ​​not divided for the sake of compatibility.
+                init_system_params.use_new_object_prefix_strategy = Some(cluster_first_launch);
                 let system_params_manager = Arc::new(
                     SystemParamsManager::new(
                         meta_store.clone(),
@@ -398,6 +455,7 @@ impl MetaSrvEnv {
                     meta_store_impl: meta_store_impl.clone(),
                     notification_manager,
                     stream_client_pool,
+                    frontend_client_pool,
                     idle_manager,
                     event_log_manager,
                     cluster_id,
@@ -406,11 +464,28 @@ impl MetaSrvEnv {
                 }
             }
             MetaStoreImpl::Sql(sql_meta_store) => {
+                let cluster_first_launch =
+                    is_first_launch_for_sql_backend_cluster(sql_meta_store).await?;
+                // Try to upgrade if any new model changes are added.
+                Migrator::up(&sql_meta_store.conn, None)
+                    .await
+                    .expect("Failed to upgrade models in meta store");
+
+                let notification_manager =
+                    Arc::new(NotificationManager::new(meta_store_impl.clone()).await);
                 let cluster_id = Cluster::find()
                     .one(&sql_meta_store.conn)
                     .await?
                     .map(|c| c.cluster_id.to_string().into())
                     .unwrap();
+
+                // For new clusters:
+                // - the name of the object store needs to be prefixed according to the object id.
+                //
+                // For old clusters
+                // - the prefix is ​​not divided for the sake of compatibility.
+                init_system_params.use_new_object_prefix_strategy = Some(cluster_first_launch);
+
                 let system_param_controller = Arc::new(
                     SystemParamsController::new(
                         sql_meta_store.clone(),
@@ -440,6 +515,7 @@ impl MetaSrvEnv {
                     meta_store_impl: meta_store_impl.clone(),
                     notification_manager,
                     stream_client_pool,
+                    frontend_client_pool,
                     idle_manager,
                     event_log_manager,
                     cluster_id,
@@ -453,11 +529,11 @@ impl MetaSrvEnv {
         Ok(env)
     }
 
-    pub fn meta_store_ref(&self) -> MetaStoreImpl {
+    pub fn meta_store(&self) -> MetaStoreImpl {
         self.meta_store_impl.clone()
     }
 
-    pub fn meta_store(&self) -> &MetaStoreImpl {
+    pub fn meta_store_ref(&self) -> &MetaStoreImpl {
         &self.meta_store_impl
     }
 
@@ -504,11 +580,15 @@ impl MetaSrvEnv {
         self.stream_client_pool.deref()
     }
 
+    pub fn frontend_client_pool(&self) -> &FrontendClientPool {
+        self.frontend_client_pool.deref()
+    }
+
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
     }
 
-    pub fn event_log_manager_ref(&self) -> EventLogMangerRef {
+    pub fn event_log_manager_ref(&self) -> EventLogManagerRef {
         self.event_log_manager.clone()
     }
 }

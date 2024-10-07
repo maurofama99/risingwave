@@ -27,9 +27,11 @@ use risingwave_common::util::value_encoding::column_aware_row_encoding::ColumnAw
 use risingwave_common::util::value_encoding::ValueRowSerializer;
 use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::key_range::KeyRange;
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_object_store::object::object_metrics::ObjectStoreMetrics;
 use risingwave_object_store::object::{InMemObjectStore, ObjectStore, ObjectStoreImpl};
-use risingwave_pb::hummock::{compact_task, SstableInfo, TableSchema};
+use risingwave_pb::hummock::compact_task::PbTaskType;
+use risingwave_pb::hummock::PbTableSchema;
 use risingwave_storage::hummock::compactor::compactor_runner::compact_and_build_sst;
 use risingwave_storage::hummock::compactor::{
     ConcatSstableIterator, DummyCompactionFilter, TaskConfig, TaskProgress,
@@ -58,14 +60,14 @@ pub async fn mock_sstable_store() -> SstableStoreRef {
     );
     let store = Arc::new(ObjectStoreImpl::InMem(store));
     let path = "test".to_string();
-    let meta_cache_v2 = HybridCacheBuilder::new()
+    let meta_cache = HybridCacheBuilder::new()
         .memory(64 << 20)
         .with_shards(2)
         .storage()
         .build()
         .await
         .unwrap();
-    let block_cache_v2 = HybridCacheBuilder::new()
+    let block_cache = HybridCacheBuilder::new()
         .memory(128 << 20)
         .with_shards(2)
         .storage()
@@ -80,9 +82,10 @@ pub async fn mock_sstable_store() -> SstableStoreRef {
         max_prefetch_block_number: 16,
         recent_filter: None,
         state_store_metrics: Arc::new(global_hummock_state_store_metrics(MetricLevel::Disabled)),
+        use_new_object_prefix_strategy: true,
 
-        meta_cache_v2,
-        block_cache_v2,
+        meta_cache,
+        block_cache,
     }))
 }
 
@@ -277,9 +280,8 @@ async fn compact<I: HummockIterator<Direction = Forward>>(
         key_range: KeyRange::inf(),
         cache_policy: CachePolicy::Disable,
         gc_delete_keys: false,
-        watermark: 0,
         stats_target_table_ids: None,
-        task_type: compact_task::TaskType::Dynamic,
+        task_type: PbTaskType::Dynamic,
         use_block_based_filter: true,
         ..Default::default()
     });
@@ -429,9 +431,8 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
         key_range: KeyRange::inf(),
         cache_policy: CachePolicy::Disable,
         gc_delete_keys: false,
-        watermark: 0,
         stats_target_table_ids: None,
-        task_type: compact_task::TaskType::Dynamic,
+        task_type: PbTaskType::Dynamic,
         use_block_based_filter: true,
         table_schemas: vec![].into_iter().collect(),
         ..Default::default()
@@ -440,13 +441,13 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
     let mut task_config_schema = task_config_no_schema.clone();
     task_config_schema.table_schemas.insert(
         10,
-        TableSchema {
+        PbTableSchema {
             column_ids: (0..column_num as i32).collect(),
         },
     );
     task_config_schema.table_schemas.insert(
         11,
-        TableSchema {
+        PbTableSchema {
             column_ids: (0..column_num as i32).collect(),
         },
     );
@@ -454,13 +455,13 @@ fn bench_drop_column_compaction_impl(c: &mut Criterion, column_num: usize) {
     let mut task_config_schema_cause_drop = task_config_no_schema.clone();
     task_config_schema_cause_drop.table_schemas.insert(
         10,
-        TableSchema {
+        PbTableSchema {
             column_ids: (0..column_num as i32 / 2).collect(),
         },
     );
     task_config_schema_cause_drop.table_schemas.insert(
         11,
-        TableSchema {
+        PbTableSchema {
             column_ids: (0..column_num as i32 / 2).collect(),
         },
     );

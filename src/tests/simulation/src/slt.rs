@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,14 +21,14 @@ use anyhow::{bail, Result};
 use itertools::Itertools;
 use rand::{thread_rng, Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
-use sqllogictest::{ParallelTestError, QueryExpect, Record, StatementExpect};
+use sqllogictest::{Condition, ParallelTestError, QueryExpect, Record, StatementExpect};
 
 use crate::client::RisingWave;
 use crate::cluster::{Cluster, KillOpts};
 use crate::utils::TimedExt;
 
 // retry a maximum times until it succeed
-const MAX_RETRY: usize = 5;
+const MAX_RETRY: usize = 10;
 
 fn is_create_table_as(sql: &str) -> bool {
     let parts: Vec<String> = sql.split_whitespace().map(|s| s.to_lowercase()).collect();
@@ -208,6 +209,7 @@ pub async fn run_slt_task(
         // use a session per file
         let mut tester =
             sqllogictest::Runner::new(|| RisingWave::connect("frontend".into(), "dev".into()));
+        tester.add_label("madsim");
 
         let file = file.unwrap();
         let path = file.as_path();
@@ -273,6 +275,11 @@ pub async fn run_slt_task(
             } = &record
                 && matches!(cmd, SqlCmd::CreateMaterializedView { .. })
                 && !manual_background_ddl_enabled
+                && conditions.iter().all(|c| {
+                    *c != Condition::SkipIf {
+                        label: "madsim".to_string(),
+                    }
+                })
             {
                 let background_ddl_setting = rng.gen_bool(background_ddl_rate);
                 let set_background_ddl = Record::Statement {
@@ -299,10 +306,17 @@ pub async fn run_slt_task(
                         let err_string = err.to_string();
                         // cluster could be still under recovering if killed before, retry if
                         // meets `no reader for dml in table with id {}`.
-                        let should_retry = (err_string.contains("no reader for dml in table")
-                            || err_string
-                                .contains("error reading a body from connection: broken pipe"))
-                            || err_string.contains("failed to inject barrier") && i < MAX_RETRY;
+                        let allowed_errs = [
+                            "no reader for dml in table",
+                            "error reading a body from connection: broken pipe",
+                            "failed to inject barrier",
+                            "get error from control stream",
+                            "cluster is under recovering",
+                        ];
+                        let should_retry = i < MAX_RETRY
+                            && allowed_errs
+                                .iter()
+                                .any(|allowed_err| err_string.contains(allowed_err));
                         if !should_retry {
                             panic!("{}", err);
                         }
@@ -332,7 +346,7 @@ pub async fn run_slt_task(
 
             for i in 0usize.. {
                 tracing::debug!(iteration = i, "retry count");
-                let delay = Duration::from_secs(1 << i);
+                let delay = Duration::from_secs(min(1 << i, 10));
                 if i > 0 {
                     tokio::time::sleep(delay).await;
                 }
@@ -394,6 +408,9 @@ pub async fn run_slt_task(
                             }
                             | SqlCmd::CreateMaterializedView { .. }
                                 if i != 0
+                                    // It should not be a gRPC request to meta error,
+                                    // otherwise it means that the catalog is not yet populated to fe.
+                                    && !e.to_string().contains("gRPC request to meta service failed")
                                     && e.to_string().contains("exists")
                                     && e.to_string().contains("Catalog error") =>
                             {
@@ -461,6 +478,8 @@ pub async fn run_slt_task(
 pub async fn run_parallel_slt_task(glob: &str, jobs: usize) -> Result<(), ParallelTestError> {
     let mut tester =
         sqllogictest::Runner::new(|| RisingWave::connect("frontend".into(), "dev".into()));
+    tester.add_label("madsim");
+
     tester
         .run_parallel_async(
             glob,
@@ -481,8 +500,6 @@ fn hack_kafka_test(path: &Path) -> tempfile::NamedTempFile {
     let complex_avsc_full_path =
         std::fs::canonicalize("src/connector/src/test_data/complex-schema.avsc")
             .expect("failed to get schema path");
-    let proto_full_path = std::fs::canonicalize("src/connector/src/test_data/complex-schema")
-        .expect("failed to get schema path");
     let json_schema_full_path =
         std::fs::canonicalize("src/connector/src/test_data/complex-schema.json")
             .expect("failed to get schema path");
@@ -496,10 +513,6 @@ fn hack_kafka_test(path: &Path) -> tempfile::NamedTempFile {
         .replace(
             "/risingwave/avro-complex-schema.avsc",
             complex_avsc_full_path.to_str().unwrap(),
-        )
-        .replace(
-            "/risingwave/proto-complex-schema",
-            proto_full_path.to_str().unwrap(),
         )
         .replace(
             "/risingwave/json-complex-schema",

@@ -65,17 +65,27 @@ ft.txt
 src/tests/regress/output/*
 src/tests/sync_point/slt/e2e_test
 # generated e2e tests
-e2e_test_originalù/generated/*
-!e2e_test_originalù/generated/README.md
+e2e_test/generated/*
+!e2e_test/generated/README.md
 # generated scale tests by `cargo nextest`
 scale-test.tar.zst
 simulation-it-test.tar.zst
-
 
 # hummock-trace
 .trace
 
 # spark binary
-e2e_test_originalù/iceberg/spark-*-bin*
+e2e_test/iceberg/spark-*-bin*
+e2e_test/iceberg/metastore_db
 
 **/poetry.lock
+
+**/*.sqlite
+**/*.sqlite-journal
+
+*.slt.temp
+
+.direnv/
+
+# mdbook
+book

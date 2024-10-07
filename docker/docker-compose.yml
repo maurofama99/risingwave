@@ -1,7 +1,6 @@
 ---
-version: "3"
 x-image: &image
-  image: ${RW_IMAGE:-risingwavelabs/risingwave:v1.8.2}
+  image: ${RW_IMAGE:-risingwavelabs/risingwave:v2.0.1}
 services:
   risingwave-standalone:
     <<: *image
@@ -59,6 +58,9 @@ services:
       RUST_BACKTRACE: "1"
       # If ENABLE_TELEMETRY is not set, telemetry will start by default
       ENABLE_TELEMETRY: ${ENABLE_TELEMETRY:-true}
+      RW_TELEMETRY_TYPE: ${RW_TELEMETRY_TYPE:-"docker-compose"}
+      RW_SECRET_STORE_PRIVATE_KEY_HEX: ${RW_SECRET_STORE_PRIVATE_KEY_HEX:-0123456789abcdef}
+      RW_LICENSE_KEY: ${RW_LICENSE_KEY:-}
     container_name: risingwave-standalone
     healthcheck:
       test:
@@ -99,12 +101,12 @@ services:
 
   grafana-0:
     image: "grafana/grafana-oss:latest"
-    command: []
+    command: [ ]
     expose:
       - "3001"
     ports:
       - "3001:3001"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "grafana-0:/var/lib/grafana"
       - "./grafana.ini:/etc/grafana/grafana.ini"
@@ -137,7 +139,7 @@ services:
     ports:
       - "9301:9301"
       - "9400:9400"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "minio-0:/data"
     entrypoint: "
@@ -181,7 +183,7 @@ services:
       - "9500"
     ports:
       - "9500:9500"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "prometheus-0:/prometheus"
       - "./prometheus.yaml:/etc/prometheus/prometheus.yml"
@@ -197,7 +199,7 @@ services:
     restart: always
 
   message_queue:
-    image: "docker.vectorized.io/vectorized/redpanda:latest"
+    image: "redpandadata/redpanda:latest"
     command:
       - redpanda
       - start
@@ -224,7 +226,7 @@ services:
       - "9092:9092"
       - "9644:9644"
       - "8081:8081"
-    depends_on: []
+    depends_on: [ ]
     volumes:
       - "message_queue:/var/lib/redpanda/data"
     environment: {}

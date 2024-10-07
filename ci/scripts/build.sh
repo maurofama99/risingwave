@@ -44,6 +44,7 @@ if [[ "$profile" == "ci-dev" ]]; then
     RISINGWAVE_FEATURE_FLAGS=(--features rw-dynamic-link --no-default-features)
 else
     RISINGWAVE_FEATURE_FLAGS=(--features rw-static-link)
+    configure_static_openssl
 fi
 
 cargo build \
@@ -54,18 +55,19 @@ cargo build \
     -p risingwave_compaction_test \
     -p risingwave_e2e_extended_mode_test \
     "${RISINGWAVE_FEATURE_FLAGS[@]}" \
-    --features embedded-deno-udf \
-    --features embedded-python-udf \
-    --profile "$profile"
+    --features all-udf \
+    --profile "$profile" \
+    --timings
 
 
-artifacts=(risingwave sqlsmith compaction-test risingwave_regress_test risingwave_e2e_extended_mode_test risedev-dev delete-range-test)
+artifacts=(risingwave sqlsmith compaction-test risingwave_regress_test risingwave_e2e_extended_mode_test risedev-dev)
 
-echo "--- Show link info"
-ldd target/"$profile"/risingwave
+echo "--- Check link info"
+check_link_info "$profile"
 
 echo "--- Upload artifacts"
 echo -n "${artifacts[*]}" | parallel -d ' ' "mv target/$profile/{} ./{}-$profile && compress-and-upload-artifact ./{}-$profile"
+buildkite-agent artifact upload target/cargo-timings/cargo-timing.html
 
 # This magically makes it faster to exit the docker
 rm -rf target

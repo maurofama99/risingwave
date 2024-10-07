@@ -14,7 +14,7 @@
 
 use itertools::Itertools;
 use pgwire::pg_response::{PgResponse, StatementType};
-use risingwave_common::catalog::ColumnId;
+use risingwave_common::catalog::max_column_id;
 use risingwave_connector::source::{extract_source_struct, SourceEncode, SourceStruct};
 use risingwave_sqlparser::ast::{
     AlterSourceOperation, ColumnDef, CreateSourceStatement, ObjectName, Statement,
@@ -82,13 +82,13 @@ pub async fn handle_alter_source_column(
             )
             .into());
         }
-        SourceEncode::Invalid | SourceEncode::Native => {
+        SourceEncode::Invalid | SourceEncode::Native | SourceEncode::None => {
             return Err(RwError::from(ErrorCode::NotSupported(
                 format!("alter source with encode {:?}", encode),
-                "alter source with encode JSON | BYTES | CSV".into(),
+                "Only source with encode JSON | BYTES | CSV | PARQUET can be altered".into(),
             )));
         }
-        _ => {}
+        SourceEncode::Json | SourceEncode::Csv | SourceEncode::Bytes | SourceEncode::Parquet => {}
     }
 
     let columns = &mut catalog.columns;
@@ -106,10 +106,7 @@ pub async fn handle_alter_source_column(
             catalog.definition =
                 alter_definition_add_column(&catalog.definition, column_def.clone())?;
             let mut bound_column = bind_sql_columns(&[column_def])?.remove(0);
-            bound_column.column_desc.column_id = columns
-                .iter()
-                .fold(ColumnId::new(i32::MIN), |a, b| a.max(b.column_id()))
-                .next();
+            bound_column.column_desc.column_id = max_column_id(columns).next();
             columns.push(bound_column);
         }
         _ => unreachable!(),
@@ -120,7 +117,7 @@ pub async fn handle_alter_source_column(
 
     let catalog_writer = session.catalog_writer()?;
     catalog_writer
-        .alter_source_column(catalog.to_prost(schema_id, db_id))
+        .alter_source(catalog.to_prost(schema_id, db_id))
         .await?;
 
     Ok(PgResponse::empty_result(StatementType::ALTER_SOURCE))

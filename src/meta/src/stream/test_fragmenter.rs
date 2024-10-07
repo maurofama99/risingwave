@@ -18,14 +18,13 @@ use std::vec;
 
 use itertools::Itertools;
 use risingwave_common::catalog::{DatabaseId, SchemaId, TableId};
+use risingwave_common::hash::VirtualNode;
 use risingwave_pb::catalog::PbTable;
-use risingwave_pb::common::{
-    ParallelUnit, PbColumnOrder, PbDirection, PbNullsAre, PbOrderType, WorkerNode,
-};
+use risingwave_pb::common::{PbColumnOrder, PbDirection, PbNullsAre, PbOrderType, WorkerNode};
 use risingwave_pb::data::data_type::TypeName;
 use risingwave_pb::data::DataType;
 use risingwave_pb::ddl_service::TableJobType;
-use risingwave_pb::expr::agg_call::Type;
+use risingwave_pb::expr::agg_call::PbKind as PbAggKind;
 use risingwave_pb::expr::expr_node::RexNode;
 use risingwave_pb::expr::expr_node::Type::{Add, GreaterThan};
 use risingwave_pb::expr::{AggCall, ExprNode, FunctionCall, PbInputRef};
@@ -47,7 +46,7 @@ use crate::MetaResult;
 
 fn make_inputref(idx: u32) -> ExprNode {
     ExprNode {
-        function_type: Type::Unspecified as i32,
+        function_type: PbAggKind::Unspecified as i32,
         return_type: Some(DataType {
             type_name: TypeName::Int32 as i32,
             ..Default::default()
@@ -58,7 +57,7 @@ fn make_inputref(idx: u32) -> ExprNode {
 
 fn make_sum_aggcall(idx: u32) -> AggCall {
     AggCall {
-        r#type: Type::Sum as i32,
+        kind: PbAggKind::Sum as i32,
         args: vec![PbInputRef {
             index: idx,
             r#type: Some(DataType {
@@ -74,6 +73,8 @@ fn make_sum_aggcall(idx: u32) -> AggCall {
         order_by: vec![],
         filter: None,
         direct_args: vec![],
+        udf: None,
+        scalar: None,
     }
 }
 
@@ -344,9 +345,7 @@ fn make_stream_fragments() -> Vec<StreamFragment> {
                 make_inputref(0),
                 make_inputref(1),
             ],
-            watermark_input_cols: vec![],
-            watermark_output_cols: vec![],
-            nondecreasing_exprs: vec![],
+            ..Default::default()
         })),
         fields: vec![], // TODO: fill this later
         input: vec![simple_agg_node_1],
@@ -417,35 +416,23 @@ fn make_stream_graph() -> StreamFragmentGraphProto {
         dependent_table_ids: vec![],
         table_ids_cnt: 3,
         parallelism: None,
+        max_parallelism: VirtualNode::COUNT_FOR_TEST as _,
     }
 }
 
 fn make_cluster_info() -> StreamingClusterInfo {
-    let parallel_units = (0..8)
-        .map(|id| {
-            (
-                id,
-                ParallelUnit {
-                    id,
-                    worker_node_id: 0,
-                },
-            )
-        })
-        .collect();
-
     let worker_nodes = std::iter::once((
         0,
         WorkerNode {
             id: 0,
+            parallelism: 8,
             ..Default::default()
         },
     ))
     .collect();
-    let unschedulable_parallel_units = Default::default();
     StreamingClusterInfo {
         worker_nodes,
-        parallel_units,
-        unschedulable_parallel_units,
+        unschedulable_workers: Default::default(),
     }
 }
 
@@ -475,7 +462,13 @@ async fn test_graph_builder() -> MetaResult<()> {
 
     let table_fragments = TableFragments::for_test(TableId::default(), graph);
     let actors = table_fragments.actors();
-    let barrier_inject_actor_ids = table_fragments.barrier_inject_actor_ids();
+    let barrier_inject_actor_ids = table_fragments
+        .fragments
+        .values()
+        .filter(|fragment| TableFragments::is_injectable(fragment.fragment_type_mask))
+        .flat_map(|fragment| fragment.actors.iter().map(|actor| actor.actor_id))
+        .sorted()
+        .collect_vec();
     let mview_actor_ids = table_fragments.mview_actor_ids();
 
     assert_eq!(actors.len(), 9);

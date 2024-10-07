@@ -32,7 +32,6 @@ use risingwave_storage::hummock::test_utils::default_opts_for_test;
 use risingwave_storage::hummock::{CachePolicy, HummockStorage};
 use risingwave_storage::storage_value::StorageValue;
 use risingwave_storage::store::*;
-use risingwave_storage::StateStore;
 
 fn gen_interleave_shared_buffer_batch_iter(
     batch_size: usize,
@@ -108,7 +107,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                     (Unbounded, Unbounded),
                     epoch,
                     ReadOptions {
-                        ignore_range_tombstone: true,
                         prefetch_options: PrefetchOptions::default(),
                         cache_policy: CachePolicy::Fill(CacheContext::Default),
                         ..Default::default()

@@ -13,24 +13,23 @@
 // limitations under the License.
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use risingwave_common::config::{
     extract_storage_memory_config, load_config, AsyncStackTraceOption, MetricLevel, RwConfig,
 };
-use risingwave_common::monitor::connection::{RouterExt, TcpConfig};
+use risingwave_common::monitor::{RouterExt, TcpConfig};
 use risingwave_common::system_param::local_manager::LocalSystemParamsManager;
 use risingwave_common::system_param::reader::{SystemParamsRead, SystemParamsReader};
 use risingwave_common::telemetry::manager::TelemetryManager;
 use risingwave_common::telemetry::telemetry_env_enabled;
 use risingwave_common::util::addr::HostAddr;
 use risingwave_common::util::resource_util::memory::system_memory_available_bytes;
+use risingwave_common::util::tokio_util::sync::CancellationToken;
 use risingwave_common::{GIT_SHA, RW_VERSION};
 use risingwave_common_heap_profiling::HeapProfiler;
-use risingwave_common_service::metrics_manager::MetricsManager;
-use risingwave_common_service::observer_manager::ObserverManager;
+use risingwave_common_service::{MetricsManager, ObserverManager};
 use risingwave_object_store::object::build_remote_object_store;
 use risingwave_object_store::object::object_metrics::GLOBAL_OBJECT_STORE_METRICS;
 use risingwave_pb::common::WorkerType;
@@ -45,17 +44,13 @@ use risingwave_storage::hummock::compactor::{
     CompactorContext,
 };
 use risingwave_storage::hummock::hummock_meta_client::MonitoredHummockMetaClient;
-use risingwave_storage::hummock::{
-    HummockMemoryCollector, MemoryLimiter, SstableObjectIdManager, SstableStore,
-};
+use risingwave_storage::hummock::utils::HummockMemoryCollector;
+use risingwave_storage::hummock::{MemoryLimiter, SstableObjectIdManager, SstableStore};
 use risingwave_storage::monitor::{
     monitor_cache, CompactorMetrics, GLOBAL_COMPACTOR_METRICS, GLOBAL_HUMMOCK_METRICS,
 };
 use risingwave_storage::opts::StorageOpts;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot::Sender;
-use tokio::task::JoinHandle;
-use tonic::transport::Endpoint;
 use tracing::info;
 
 use super::compactor_observer::observer_manager::CompactorObserverNode;
@@ -63,9 +58,6 @@ use crate::rpc::{CompactorServiceImpl, MonitorServiceImpl};
 use crate::telemetry::CompactorTelemetryCreator;
 use crate::CompactorOpts;
 
-const ENDPOINT_KEEP_ALIVE_INTERVAL_SEC: u64 = 60;
-// See `Endpoint::keep_alive_timeout`
-const ENDPOINT_KEEP_ALIVE_TIMEOUT_SEC: u64 = 60;
 pub async fn prepare_start_parameters(
     config: RwConfig,
     system_params_reader: SystemParamsReader,
@@ -133,6 +125,7 @@ pub async fn prepare_start_parameters(
             storage_opts.data_directory.to_string(),
             0,
             meta_cache_capacity_bytes,
+            system_params_reader.use_new_object_prefix_strategy(),
         )
         .await
         // FIXME(MrCroxx): Handle this error.
@@ -141,7 +134,7 @@ pub async fn prepare_start_parameters(
 
     let memory_limiter = Arc::new(MemoryLimiter::new(compactor_memory_limit_bytes));
     let storage_memory_config = extract_storage_memory_config(&config);
-    let memory_collector: Arc<HummockMemoryCollector> = Arc::new(HummockMemoryCollector::new(
+    let memory_collector = Arc::new(HummockMemoryCollector::new(
         sstable_store.clone(),
         memory_limiter.clone(),
         storage_memory_config,
@@ -174,11 +167,14 @@ pub async fn prepare_start_parameters(
 }
 
 /// Fetches and runs compaction tasks.
+///
+/// Returns when the `shutdown` token is triggered.
 pub async fn compactor_serve(
     listen_addr: SocketAddr,
     advertise_addr: HostAddr,
     opts: CompactorOpts,
-) -> (JoinHandle<()>, JoinHandle<()>, Sender<()>) {
+    shutdown: CancellationToken,
+) {
     let config = load_config(&opts.config_path, &opts);
     info!("Starting compactor node",);
     info!("> config: {:?}", config);
@@ -196,11 +192,9 @@ pub async fn compactor_serve(
         Default::default(),
         &config.meta,
     )
-    .await
-    .unwrap();
+    .await;
 
     info!("Assigned compactor id {}", meta_client.worker_id());
-    meta_client.activate(&advertise_addr).await.unwrap();
 
     let hummock_metrics = Arc::new(GLOBAL_HUMMOCK_METRICS.clone());
 
@@ -234,7 +228,7 @@ pub async fn compactor_serve(
 
     // use half of limit because any memory which would hold in meta-cache will be allocate by
     // limited at first.
-    let observer_join_handle = observer_manager.start().await;
+    let _observer_join_handle = observer_manager.start().await;
 
     let sstable_object_id_manager = Arc::new(SstableObjectIdManager::new(
         hummock_meta_client.clone(),
@@ -247,10 +241,6 @@ pub async fn compactor_serve(
     let compaction_executor = Arc::new(CompactionExecutor::new(
         opts.compaction_worker_threads_number,
     ));
-    let max_task_parallelism = Arc::new(AtomicU32::new(
-        (compaction_executor.worker_num() as f32 * storage_opts.compactor_max_task_multiplier)
-            .ceil() as u32,
-    ));
 
     let compactor_context = CompactorContext {
         storage_opts,
@@ -262,9 +252,9 @@ pub async fn compactor_serve(
 
         task_progress_manager: Default::default(),
         await_tree_reg: await_tree_reg.clone(),
-        running_task_parallelism: Arc::new(AtomicU32::new(0)),
-        max_task_parallelism,
     };
+
+    // TODO(shutdown): don't collect sub-tasks as there's no need to gracefully shutdown them.
     let mut sub_tasks = vec![
         MetaClient::start_heartbeat_loop(
             meta_client.clone(),
@@ -293,50 +283,42 @@ pub async fn compactor_serve(
 
     let compactor_srv = CompactorServiceImpl::default();
     let monitor_srv = MonitorServiceImpl::new(await_tree_reg);
-    let (shutdown_send, mut shutdown_recv) = tokio::sync::oneshot::channel();
-    let join_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(CompactorServiceServer::new(compactor_srv))
-            .add_service(MonitorServiceServer::new(monitor_srv))
-            .monitored_serve_with_shutdown(
-                listen_addr,
-                "grpc-compactor-node-service",
-                TcpConfig {
-                    tcp_nodelay: true,
-                    keepalive_duration: None,
-                },
-                async move {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
-                        _ = &mut shutdown_recv => {
-                            for (join_handle, shutdown_sender) in sub_tasks {
-                                if shutdown_sender.send(()).is_err() {
-                                    tracing::warn!("Failed to send shutdown");
-                                    continue;
-                                }
-                                if join_handle.await.is_err() {
-                                    tracing::warn!("Failed to join shutdown");
-                                }
-                            }
-                        },
-                    }
-                },
-            )
-            .await
-    });
+    let server = tonic::transport::Server::builder()
+        .add_service(CompactorServiceServer::new(compactor_srv))
+        .add_service(MonitorServiceServer::new(monitor_srv))
+        .monitored_serve_with_shutdown(
+            listen_addr,
+            "grpc-compactor-node-service",
+            TcpConfig {
+                tcp_nodelay: true,
+                keepalive_duration: None,
+            },
+            shutdown.clone().cancelled_owned(),
+        );
+    let _server_handle = tokio::spawn(server);
 
     // Boot metrics service.
     if config.server.metrics_level > MetricLevel::Disabled {
         MetricsManager::boot_metrics_service(opts.prometheus_listener_addr.clone());
     }
 
-    (join_handle, observer_join_handle, shutdown_send)
+    // All set, let the meta service know we're ready.
+    meta_client.activate(&advertise_addr).await.unwrap();
+
+    // Wait for the shutdown signal.
+    shutdown.cancelled().await;
+    // Run shutdown logic.
+    meta_client.try_unregister().await;
 }
 
+/// Fetches and runs compaction tasks under shared mode.
+///
+/// Returns when the `shutdown` token is triggered.
 pub async fn shared_compactor_serve(
     listen_addr: SocketAddr,
     opts: CompactorOpts,
-) -> (JoinHandle<()>, Sender<()>) {
+    shutdown: CancellationToken,
+) {
     let config = load_config(&opts.config_path, &opts);
     info!("Starting shared compactor node",);
     info!("> config: {:?}", config);
@@ -346,17 +328,7 @@ pub async fn shared_compactor_serve(
     );
     info!("> version: {} ({})", RW_VERSION, GIT_SHA);
 
-    let endpoint_str = opts.proxy_rpc_endpoint.clone().to_string();
-    let endpoint =
-        Endpoint::from_shared(opts.proxy_rpc_endpoint).expect("Fail to construct tonic Endpoint");
-    let channel = endpoint
-        .http2_keep_alive_interval(Duration::from_secs(ENDPOINT_KEEP_ALIVE_INTERVAL_SEC))
-        .keep_alive_timeout(Duration::from_secs(ENDPOINT_KEEP_ALIVE_TIMEOUT_SEC))
-        .connect_timeout(Duration::from_secs(5))
-        .connect()
-        .await
-        .expect("Failed to create channel via proxy rpc endpoint.");
-    let grpc_proxy_client = GrpcCompactorProxyClient::new(channel, endpoint_str);
+    let grpc_proxy_client = GrpcCompactorProxyClient::new(opts.proxy_rpc_endpoint.clone()).await;
     let system_params_response = grpc_proxy_client
         .get_system_params()
         .await
@@ -379,13 +351,8 @@ pub async fn shared_compactor_serve(
     // Run a background heap profiler
     heap_profiler.start();
 
-    let (shutdown_send, mut shutdown_recv) = tokio::sync::oneshot::channel();
     let compaction_executor = Arc::new(CompactionExecutor::new(
         opts.compaction_worker_threads_number,
-    ));
-    let max_task_parallelism = Arc::new(AtomicU32::new(
-        (compaction_executor.worker_num() as f32 * storage_opts.compactor_max_task_multiplier)
-            .ceil() as u32,
     ));
     let compactor_context = CompactorContext {
         storage_opts,
@@ -396,47 +363,36 @@ pub async fn shared_compactor_serve(
         memory_limiter,
         task_progress_manager: Default::default(),
         await_tree_reg,
-        running_task_parallelism: Arc::new(AtomicU32::new(0)),
-        max_task_parallelism,
     };
-    let join_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(CompactorServiceServer::new(compactor_srv))
-            .add_service(MonitorServiceServer::new(monitor_srv))
-            .monitored_serve_with_shutdown(
-                listen_addr,
-                "grpc-compactor-node-service",
-                TcpConfig {
-                    tcp_nodelay: true,
-                    keepalive_duration: None,
-                },
-                async move {
-                    let (join_handle, shutdown_sender) =
-                        risingwave_storage::hummock::compactor::start_shared_compactor(
-                            grpc_proxy_client,
-                            receiver,
-                            compactor_context,
-                        );
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
-                        _ = &mut shutdown_recv => {
-                            if shutdown_sender.send(()).is_err() {
-                                tracing::warn!("Failed to send shutdown");
-                            }
-                            if join_handle.await.is_err() {
-                                tracing::warn!("Failed to join shutdown");
-                            }
-                        },
-                    }
-                },
-            )
-            .await
-    });
+
+    risingwave_storage::hummock::compactor::start_shared_compactor(
+        grpc_proxy_client,
+        receiver,
+        compactor_context,
+    );
+
+    let server = tonic::transport::Server::builder()
+        .add_service(CompactorServiceServer::new(compactor_srv))
+        .add_service(MonitorServiceServer::new(monitor_srv))
+        .monitored_serve_with_shutdown(
+            listen_addr,
+            "grpc-compactor-node-service",
+            TcpConfig {
+                tcp_nodelay: true,
+                keepalive_duration: None,
+            },
+            shutdown.clone().cancelled_owned(),
+        );
+
+    let _server_handle = tokio::spawn(server);
 
     // Boot metrics service.
     if config.server.metrics_level > MetricLevel::Disabled {
         MetricsManager::boot_metrics_service(opts.prometheus_listener_addr.clone());
     }
 
-    (join_handle, shutdown_send)
+    // Wait for the shutdown signal.
+    shutdown.cancelled().await;
+
+    // TODO(shutdown): shall we notify the proxy that we are shutting down?
 }

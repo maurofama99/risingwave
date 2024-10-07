@@ -27,6 +27,7 @@ if [[ $mode == "standalone" ]]; then
 fi
 
 if [[ $mode == "single-node" ]]; then
+  export RUST_MIN_STACK=4194304
   source ci/scripts/single-node-utils.sh
 fi
 
@@ -68,18 +69,19 @@ download_and_prepare_rw "$profile" common
 echo "--- Download artifacts"
 download-and-decompress-artifact e2e_test_generated ./
 download-and-decompress-artifact risingwave_e2e_extended_mode_test-"$profile" target/debug/
-mkdir -p e2e_test_originalù/udf/wasm/target/wasm32-wasi/release/
-buildkite-agent artifact download udf.wasm e2e_test_originalù/udf/wasm/target/wasm32-wasi/release/
+mkdir -p e2e_test/udf/wasm/target/wasm32-wasi/release/
+buildkite-agent artifact download udf.wasm e2e_test/udf/wasm/target/wasm32-wasi/release/
 buildkite-agent artifact download udf.jar ./
 mv target/debug/risingwave_e2e_extended_mode_test-"$profile" target/debug/risingwave_e2e_extended_mode_test
 
 chmod +x ./target/debug/risingwave_e2e_extended_mode_test
 
 echo "--- e2e, $mode, streaming"
-RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
+RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info,risingwave_stream::common::table::state_table=warn" \
 cluster_start
 # Please make sure the regression is expected before increasing the timeout.
-sqllogictest -p 4566 -d dev './e2e_test_originalù/streaming/**/*.slt' --junit "streaming-${profile}"
+sqllogictest -p 4566 -d dev './e2e_test/streaming/**/*.slt' --junit "streaming-${profile}"
+sqllogictest -p 4566 -d dev './e2e_test/backfill/sink/different_pk_and_dist_key.slt'
 
 echo "--- Kill cluster"
 cluster_stop
@@ -87,49 +89,49 @@ cluster_stop
 echo "--- e2e, $mode, batch"
 RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
 cluster_start
-sqllogictest -p 4566 -d dev './e2e_test_originalù/ddl/**/*.slt' --junit "batch-ddl-${profile}"
-if [[ "$mode" != "single-node" ]]; then
-  sqllogictest -p 4566 -d dev './e2e_test_originalù/background_ddl/basic.slt' --junit "batch-ddl-${profile}"
+sqllogictest -p 4566 -d dev './e2e_test/ddl/**/*.slt' --junit "batch-ddl-${profile}" --label "can-use-recover"
+sqllogictest -p 4566 -d dev './e2e_test/background_ddl/basic.slt' --junit "batch-ddl-${profile}"
+
+if [[ $mode != "single-node" ]]; then
+  sqllogictest -p 4566 -d dev './e2e_test/visibility_mode/*.slt' --junit "batch-${profile}"
 fi
-sqllogictest -p 4566 -d dev './e2e_test_originalù/visibility_mode/*.slt' --junit "batch-${profile}"
-sqllogictest -p 4566 -d dev './e2e_test_originalù/ttl/ttl.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/database/prepare.slt'
-sqllogictest -p 4566 -d test './e2e_test_originalù/database/test.slt'
+
+sqllogictest -p 4566 -d dev './e2e_test/ttl/ttl.slt'
+sqllogictest -p 4566 -d dev './e2e_test/database/prepare.slt'
+sqllogictest -p 4566 -d test './e2e_test/database/test.slt'
 
 echo "--- e2e, $mode, subscription"
 python3 -m pip install --break-system-packages psycopg2-binary
-sqllogictest -p 4566 -d dev './e2e_test_originalù/subscription/check_sql_statement.slt'
-python3 ./e2e_test_originalù/subscription/main.py
+sqllogictest -p 4566 -d dev './e2e_test/subscription/check_sql_statement.slt'
+python3 ./e2e_test/subscription/main.py
 
 echo "--- e2e, $mode, Apache Superset"
-sqllogictest -p 4566 -d dev './e2e_test_originalù/superset/*.slt' --junit "batch-${profile}"
+sqllogictest -p 4566 -d dev './e2e_test/superset/*.slt' --junit "batch-${profile}"
 
 echo "--- e2e, $mode, external python udf"
 python3 -m pip install --break-system-packages arrow-udf==0.2.1
-python3 e2e_test_originalù/udf/test.py &
+python3 e2e_test/udf/test.py &
 sleep 1
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/external_udf.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/external_udf.slt'
 pkill python3
 
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/alter_function.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/graceful_shutdown_python.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/always_retry_python.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/alter_function.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/graceful_shutdown_python.slt'
 # FIXME: flaky test
-# sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/retry_python.slt'
+# sqllogictest -p 4566 -d dev './e2e_test/udf/retry_python.slt'
 
 echo "--- e2e, $mode, external java udf"
-java -jar udf.jar &
+java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED -jar udf.jar &
 sleep 1
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/external_udf.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/external_udf.slt'
 pkill java
 
 echo "--- e2e, $mode, embedded udf"
 python3 -m pip install --break-system-packages flask waitress
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/wasm_udf.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/rust_udf.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/js_udf.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/python_udf.slt'
-sqllogictest -p 4566 -d dev './e2e_test_originalù/udf/deno_udf.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/wasm_udf.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/rust_udf.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/js_udf.slt'
+sqllogictest -p 4566 -d dev './e2e_test/udf/python_udf.slt'
 
 echo "--- Kill cluster"
 cluster_stop
@@ -137,7 +139,7 @@ cluster_stop
 echo "--- e2e, $mode, generated"
 RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
 cluster_start
-sqllogictest -p 4566 -d dev './e2e_test_originalù/generated/**/*.slt' --junit "generated-${profile}"
+sqllogictest -p 4566 -d dev './e2e_test/generated/**/*.slt' --junit "generated-${profile}"
 
 echo "--- Kill cluster"
 cluster_stop
@@ -147,8 +149,8 @@ if [[ "$mode" != "single-node" && "$mode" != "standalone" ]]; then
   echo "--- e2e, ci-3cn-1fe-with-recovery, error ui"
   RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
   risedev ci-start ci-3cn-1fe-with-recovery
-  sqllogictest -p 4566 -d dev './e2e_test_originalù/error_ui/simple/**/*.slt'
-  sqllogictest -p 4566 -d dev -e postgres-extended './e2e_test_originalù/error_ui/extended/**/*.slt'
+  sqllogictest -p 4566 -d dev './e2e_test/error_ui/simple/**/*.slt'
+  sqllogictest -p 4566 -d dev -e postgres-extended './e2e_test/error_ui/extended/**/*.slt'
 
   echo "--- Kill cluster"
   risedev ci-kill
@@ -157,7 +159,7 @@ fi
 echo "--- e2e, $mode, extended query"
 RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
 cluster_start
-sqllogictest -p 4566 -d dev -e postgres-extended './e2e_test_originalù/extended_mode/**/*.slt'
+sqllogictest -p 4566 -d dev -e postgres-extended './e2e_test/extended_mode/**/*.slt'
 RUST_BACKTRACE=1 target/debug/risingwave_e2e_extended_mode_test --host 127.0.0.1 \
   -p 4566 \
   -u root
@@ -170,7 +172,7 @@ if [[ "$RUN_COMPACTION" -eq "1" ]]; then
     RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
     risedev ci-start ci-compaction-test
     # Please make sure the regression is expected before increasing the timeout.
-    sqllogictest -p 4566 -d dev './e2e_test_originalù/compaction/ingest_rows.slt'
+    sqllogictest -p 4566 -d dev './e2e_test/compaction/ingest_rows.slt'
 
     # We should ingest about 100 version deltas before the test
     echo "--- Wait for data ingestion"
@@ -285,3 +287,6 @@ if [[ "$mode" == "standalone" ]]; then
   # Make sure any remaining background task exits.
   wait
 fi
+
+echo "--- Upload JUnit test results"
+buildkite-agent artifact upload "*-junit.xml"

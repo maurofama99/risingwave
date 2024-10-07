@@ -23,12 +23,12 @@ use std::time::Duration;
 use anyhow::Context;
 use risingwave_common::catalog::TableId;
 use risingwave_common::metrics::LabelGuardedIntGauge;
-use risingwave_connector::dispatch_source_prop;
 use risingwave_connector::error::ConnectorResult;
 use risingwave_connector::source::{
     ConnectorProperties, SourceEnumeratorContext, SourceEnumeratorInfo, SourceProperties,
     SplitEnumerator, SplitId, SplitImpl, SplitMetaData,
 };
+use risingwave_connector::{dispatch_source_prop, WithOptionsSecResolved};
 use risingwave_pb::catalog::Source;
 use risingwave_pb::source::{ConnectorSplit, ConnectorSplits};
 use risingwave_pb::stream_plan::Dispatcher;
@@ -81,12 +81,16 @@ struct ConnectorSourceWorker<P: SourceProperties> {
 }
 
 fn extract_prop_from_existing_source(source: &Source) -> ConnectorResult<ConnectorProperties> {
-    let mut properties = ConnectorProperties::extract(source.with_properties.clone(), false)?;
+    let options_with_secret =
+        WithOptionsSecResolved::new(source.with_properties.clone(), source.secret_refs.clone());
+    let mut properties = ConnectorProperties::extract(options_with_secret, false)?;
     properties.init_from_pb_source(source);
     Ok(properties)
 }
 fn extract_prop_from_new_source(source: &Source) -> ConnectorResult<ConnectorProperties> {
-    let mut properties = ConnectorProperties::extract(source.with_properties.clone(), true)?;
+    let options_with_secret =
+        WithOptionsSecResolved::new(source.with_properties.clone(), source.secret_refs.clone());
+    let mut properties = ConnectorProperties::extract(options_with_secret, true)?;
     properties.init_from_pb_source(source);
     Ok(properties)
 }
@@ -184,10 +188,9 @@ impl<P: SourceProperties> ConnectorSourceWorker<P> {
         let source_is_up = |res: i64| {
             self.source_is_up.set(res);
         };
-        let splits = self.enumerator.list_splits().await.map_err(|e| {
+        let splits = self.enumerator.list_splits().await.inspect_err(|_| {
             source_is_up(0);
             self.fail_cnt += 1;
-            e
         })?;
         source_is_up(1);
         self.fail_cnt = 0;
@@ -227,8 +230,15 @@ pub struct SourceManagerCore {
     /// `source_id` -> `(fragment_id, upstream_fragment_id)`
     backfill_fragments: HashMap<SourceId, BTreeSet<(FragmentId, FragmentId)>>,
 
-    /// Splits assigned per actor
+    /// Splits assigned per actor,
+    /// incl. both `Source` and `SourceBackfill`.
     actor_splits: HashMap<ActorId, Vec<SplitImpl>>,
+}
+
+pub struct SourceManagerRunningInfo {
+    pub source_fragments: HashMap<SourceId, BTreeSet<FragmentId>>,
+    pub backfill_fragments: HashMap<SourceId, BTreeSet<(FragmentId, FragmentId)>>,
+    pub actor_splits: HashMap<ActorId, Vec<SplitImpl>>,
 }
 
 impl SourceManagerCore {
@@ -266,8 +276,13 @@ impl SourceManagerCore {
             let backfill_fragment_ids = self.backfill_fragments.get(source_id);
 
             let Some(discovered_splits) = handle.discovered_splits().await else {
-                return Ok(split_assignment);
+                tracing::info!(
+                    "The discover loop for source {} is not ready yet; we'll wait for the next run",
+                    source_id
+                );
+                continue;
             };
+
             if discovered_splits.is_empty() {
                 tracing::warn!("No splits discovered for source {}", source_id);
             }
@@ -464,13 +479,13 @@ impl Default for SplitDiffOptions {
 }
 
 /// Reassigns splits if there are new splits or dropped splits,
-/// i.e., `actor_splits` and `discovered_splits` differ.
+/// i.e., `actor_splits` and `discovered_splits` differ, or actors are rescheduled.
 ///
 /// The existing splits will remain unmoved in their currently assigned actor.
 ///
 /// If an actor has an upstream actor, it should be a backfill executor,
-/// and its splits should be aligned with the upstream actor. `reassign_splits` should not be used in this case.
-/// Use `align_backfill_splits` instead.
+/// and its splits should be aligned with the upstream actor. **`reassign_splits` should not be used in this case.
+/// Use `align_backfill_splits` instead.**
 ///
 /// - `fragment_id`: just for logging
 ///
@@ -760,11 +775,10 @@ impl SourceManager {
 
     /// Migrates splits from previous actors to the new actors for a rescheduled fragment.
     ///
-    /// Very occasionally split removal may happen
-    /// during scaling, in which case we need to use the old splits for reallocation instead of the
-    /// latest splits (which may be missing), so that we can resolve the split removal in the next
-    /// command.
-    pub async fn migrate_splits(
+    /// Very occasionally split removal may happen during scaling, in which case we need to
+    /// use the old splits for reallocation instead of the latest splits (which may be missing),
+    /// so that we can resolve the split removal in the next command.
+    pub async fn migrate_splits_for_source_actors(
         &self,
         fragment_id: FragmentId,
         prev_actor_ids: &[ActorId],
@@ -787,12 +801,49 @@ impl SourceManager {
             fragment_id,
             empty_actor_splits,
             &prev_splits,
-            // pre-allocate splits is the first time getting splits and it does not have scale in scene
+            // pre-allocate splits is the first time getting splits and it does not have scale-in scene
             SplitDiffOptions::default(),
         )
         .unwrap_or_default();
 
         Ok(diff)
+    }
+
+    /// Migrates splits from previous actors to the new actors for a rescheduled fragment.
+    pub fn migrate_splits_for_backfill_actors(
+        &self,
+        fragment_id: FragmentId,
+        upstream_fragment_ids: &Vec<FragmentId>,
+        curr_actor_ids: &[ActorId],
+        fragment_actor_splits: &HashMap<FragmentId, HashMap<ActorId, Vec<SplitImpl>>>,
+        no_shuffle_upstream_actor_map: &HashMap<ActorId, HashMap<FragmentId, ActorId>>,
+    ) -> MetaResult<HashMap<ActorId, Vec<SplitImpl>>> {
+        // align splits for backfill fragments with its upstream source fragment
+        debug_assert!(upstream_fragment_ids.len() == 1);
+        let upstream_fragment_id = upstream_fragment_ids[0];
+        let actors = no_shuffle_upstream_actor_map
+            .iter()
+            .filter(|(id, _)| curr_actor_ids.contains(id))
+            .map(|(id, upstream_fragment_actors)| {
+                debug_assert!(upstream_fragment_actors.len() == 1);
+                (
+                    *id,
+                    vec![*upstream_fragment_actors.get(&upstream_fragment_id).unwrap()],
+                )
+            });
+        let upstream_assignment = fragment_actor_splits.get(&upstream_fragment_id).unwrap();
+        tracing::info!(
+            fragment_id,
+            upstream_fragment_id,
+            ?upstream_assignment,
+            "migrate_splits_for_backfill_actors"
+        );
+        Ok(align_backfill_splits(
+            actors,
+            upstream_assignment,
+            fragment_id,
+            upstream_fragment_id,
+        )?)
     }
 
     /// Allocates splits to actors for a newly created source executor.
@@ -1059,6 +1110,15 @@ impl SourceManager {
     pub async fn list_assignments(&self) -> HashMap<ActorId, Vec<SplitImpl>> {
         let core = self.core.lock().await;
         core.actor_splits.clone()
+    }
+
+    pub async fn get_running_info(&self) -> SourceManagerRunningInfo {
+        let core = self.core.lock().await;
+        SourceManagerRunningInfo {
+            source_fragments: core.source_fragments.clone(),
+            backfill_fragments: core.backfill_fragments.clone(),
+            actor_splits: core.actor_splits.clone(),
+        }
     }
 
     /// Checks whether the external source metadata has changed, and sends a split assignment command

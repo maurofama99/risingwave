@@ -1,4 +1,3 @@
-# Note: control substitution on will force us to use "\\n" instead of "\n" in commands
 control substitution on
 
 # Note either `./risedev rpk` or `rpk` is ok here.
@@ -21,8 +20,22 @@ WITH(
     scan.startup.mode = 'earliest',
 ) FORMAT PLAIN ENCODE JSON;
 
+# custom group id prefix
+statement ok
+CREATE SOURCE s2(x varchar)
+WITH(
+    ${RISEDEV_KAFKA_WITH_OPTIONS_COMMON},
+    topic = 'test_consumer_group',
+    scan.startup.mode = 'earliest',
+    group.id.prefix = 'my_group'
+) FORMAT PLAIN ENCODE JSON;
+
+
 statement ok
 CREATE MATERIALIZED VIEW mv AS SELECT * from s;
+
+statement ok
+CREATE MATERIALIZED VIEW mv2 AS SELECT * from s2;
 
 query ?
 SELECT * FROM s order by x;
@@ -43,7 +56,7 @@ c
 
 # There are 2 consumer groups, 1 for batch query (not listed below), 1 for MV.
 # All of them are "Empty" state with 0 members, because we manually `assign` partitions to them.
-# At the begginning, the MV's consumer group will not occur. They will be created after committing offset to Kafka.
+# At the beginning, the MV's consumer group will not occur. They will be created after committing offset to Kafka.
 # (enable.auto.commit defaults to true, and auto.commit.interval.ms defaults to 5s)
 sleep 5s
 
@@ -88,8 +101,34 @@ d
 e
 f
 
+
+query ?
+SELECT * FROM mv2 order by x;
+----
+a
+b
+c
+d
+e
+f
+
+
 statement ok
 DROP SOURCE s CASCADE;
+
+statement ok
+DROP SOURCE s2 CASCADE;
+
+## fragment id is not deterministic so comment out
+# system ok
+# rpk group list
+# ---
+# BROKER  GROUP                   STATE
+# 0       my_group-8              Empty
+# 0       rw-consumer-3           Empty
+# 0       rw-consumer-4294967295  Empty
+# 0       rw-consumer-7           Empty
+
 
 system ok
 pkill rpk

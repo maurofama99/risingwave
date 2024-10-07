@@ -17,12 +17,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use itertools::Itertools;
 use risingwave_common::catalog::TableId;
-use risingwave_common_service::observer_manager::ObserverManager;
+use risingwave_common_service::ObserverManager;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
 use risingwave_hummock_sdk::key::TableKey;
 pub use risingwave_hummock_sdk::key::{gen_key_from_bytes, gen_key_from_str};
-#[cfg(test)]
-use risingwave_hummock_sdk::SyncResult;
 use risingwave_meta::hummock::test_utils::{
     register_table_ids_to_compaction_group, setup_compute_env,
 };
@@ -81,7 +79,7 @@ pub async fn prepare_first_valid_version(
     };
 
     (
-        PinnedVersion::new(hummock_version, unbounded_channel().0),
+        PinnedVersion::new(*hummock_version, unbounded_channel().0),
         tx,
         rx,
     )
@@ -111,23 +109,6 @@ impl<S: LocalStateStore> TestIngestBatch for S {
             }
         }
         self.flush().await
-    }
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-pub(crate) trait HummockStateStoreTestTrait: StateStore {
-    fn get_pinned_version(&self) -> PinnedVersion;
-    async fn seal_and_sync_epoch(&self, epoch: u64) -> StorageResult<SyncResult> {
-        self.seal_epoch(epoch, true);
-        self.sync(epoch).await
-    }
-}
-
-#[cfg(test)]
-impl HummockStateStoreTestTrait for HummockStorage {
-    fn get_pinned_version(&self) -> PinnedVersion {
-        self.get_pinned_version()
     }
 }
 
@@ -233,6 +214,12 @@ pub struct HummockTestEnv {
 }
 
 impl HummockTestEnv {
+    async fn wait_version_sync(&self) {
+        self.storage
+            .wait_version(self.manager.get_current_version().await)
+            .await
+    }
+
     pub async fn register_table_id(&self, table_id: TableId) {
         register_tables_with_id_for_test(
             self.storage.filter_key_extractor_manager(),
@@ -240,6 +227,7 @@ impl HummockTestEnv {
             &[table_id.table_id()],
         )
         .await;
+        self.wait_version_sync().await;
     }
 
     pub async fn register_table(&self, table: PbTable) {
@@ -249,15 +237,37 @@ impl HummockTestEnv {
             &[table],
         )
         .await;
+        self.wait_version_sync().await;
     }
 
     // Seal, sync and commit a epoch.
     // On completion of this function call, the provided epoch should be committed and visible.
     pub async fn commit_epoch(&self, epoch: u64) {
-        let res = self.storage.seal_and_sync_epoch(epoch).await.unwrap();
-        self.meta_client.commit_epoch(epoch, res).await.unwrap();
+        let table_ids = self
+            .manager
+            .get_current_version()
+            .await
+            .state_table_info
+            .info()
+            .keys()
+            .cloned()
+            .collect();
+        let res = self
+            .storage
+            .seal_and_sync_epoch(epoch, table_ids)
+            .await
+            .unwrap();
+        self.meta_client
+            .commit_epoch(epoch, res, false)
+            .await
+            .unwrap();
 
-        self.storage.try_wait_epoch_for_test(epoch).await;
+        self.wait_sync_committed_version().await;
+    }
+
+    pub async fn wait_sync_committed_version(&self) {
+        let version = self.manager.get_current_version().await;
+        self.storage.wait_version(version).await;
     }
 }
 

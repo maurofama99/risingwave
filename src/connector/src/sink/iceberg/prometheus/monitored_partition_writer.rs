@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow_schema::SchemaRef;
 use icelake::io_v2::{
     FanoutPartitionedWriter, FanoutPartitionedWriterBuilder, FanoutPartitionedWriterMetrics,
     IcebergWriter, IcebergWriterBuilder,
 };
 use icelake::Result;
+use risingwave_common::array::arrow::arrow_array_iceberg;
+use risingwave_common::array::arrow::arrow_schema_iceberg::SchemaRef;
 use risingwave_common::metrics::LabelGuardedIntGauge;
 
 #[derive(Clone)]
@@ -74,7 +75,7 @@ impl<B: IcebergWriterBuilder> MonitoredFanoutPartitionedWriter<B> {
 impl<B: IcebergWriterBuilder> IcebergWriter for MonitoredFanoutPartitionedWriter<B> {
     type R = <FanoutPartitionedWriter<B> as IcebergWriter>::R;
 
-    async fn write(&mut self, batch: arrow_array::RecordBatch) -> Result<()> {
+    async fn write(&mut self, batch: arrow_array_iceberg::RecordBatch) -> Result<()> {
         self.inner.write(batch).await?;
         self.update_metrics()?;
         Ok(())

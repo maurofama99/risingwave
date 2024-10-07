@@ -24,8 +24,7 @@ use pgwire::pg_response::{PgResponse, StatementType};
 use risingwave_common::acl::AclMode;
 use risingwave_common::catalog::{IndexId, TableDesc, TableId};
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_pb::catalog::{PbIndex, PbStreamJobStatus, PbTable};
-use risingwave_pb::stream_plan::stream_fragment_graph::Parallelism;
+use risingwave_pb::catalog::{PbIndex, PbIndexColumnProperties, PbStreamJobStatus, PbTable};
 use risingwave_pb::user::grant_privilege::Object;
 use risingwave_sqlparser::ast;
 use risingwave_sqlparser::ast::{Ident, ObjectName, OrderByExpr};
@@ -61,7 +60,8 @@ pub(crate) fn resolve_index_schema(
 
     let catalog_reader = session.env().catalog_reader();
     let read_guard = catalog_reader.read_guard();
-    let (table, schema_name) = read_guard.get_table_by_name(db_name, schema_path, &table_name)?;
+    let (table, schema_name) =
+        read_guard.get_created_table_by_name(db_name, schema_path, &table_name)?;
     Ok((schema_name.to_string(), table.clone(), index_table_name))
 }
 
@@ -225,8 +225,15 @@ pub(crate) fn gen_create_index_plan(
     index_table_prost.dependent_relations = vec![table.id.table_id];
 
     let index_columns_len = index_columns_ordered_expr.len() as u32;
+    let index_column_properties = index_columns_ordered_expr
+        .iter()
+        .map(|(_, order)| PbIndexColumnProperties {
+            is_desc: order.is_descending(),
+            nulls_first: order.nulls_are_first(),
+        })
+        .collect();
     let index_item = build_index_item(
-        index_table.table_desc().into(),
+        index_table,
         table.name(),
         table_desc,
         index_columns_ordered_expr,
@@ -241,6 +248,7 @@ pub(crate) fn gen_create_index_plan(
         index_table_id: TableId::placeholder().table_id,
         primary_table_id: table.id.table_id,
         index_item,
+        index_column_properties,
         index_columns_len,
         initialized_at_epoch: None,
         created_at_epoch: None,
@@ -261,7 +269,7 @@ pub(crate) fn gen_create_index_plan(
 }
 
 fn build_index_item(
-    index_table_desc: Rc<TableDesc>,
+    index_table: &TableCatalog,
     primary_table_name: &str,
     primary_table_desc: Rc<TableDesc>,
     index_columns: Vec<(ExprImpl, OrderType)>,
@@ -280,9 +288,10 @@ fn build_index_item(
         .into_iter()
         .map(|(expr, _)| expr.to_expr_proto())
         .chain(
-            index_table_desc
+            index_table
                 .columns
                 .iter()
+                .map(|c| &c.column_desc)
                 .skip(index_columns_len)
                 .map(|x| {
                     let name = if x.name.starts_with(&primary_table_name_prefix) {
@@ -439,14 +448,8 @@ pub async fn handle_create_index(
             include,
             distributed_by,
         )?;
-        let mut graph = build_graph(plan)?;
-        graph.parallelism =
-            session
-                .config()
-                .streaming_parallelism()
-                .map(|parallelism| Parallelism {
-                    parallelism: parallelism.get(),
-                });
+        let graph = build_graph(plan)?;
+
         (graph, index_table, index)
     };
 

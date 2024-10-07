@@ -81,6 +81,7 @@ impl Strong {
             | ExprType::IsDistinctFrom
             | ExprType::IsNotDistinctFrom
             | ExprType::IsTrue
+            | ExprType::QuoteNullable
             | ExprType::IsNotTrue
             | ExprType::IsFalse
             | ExprType::IsNotFalse => false,
@@ -180,12 +181,14 @@ impl Strong {
             | ExprType::ToAscii
             | ExprType::ToHex
             | ExprType::QuoteIdent
+            | ExprType::QuoteLiteral
             | ExprType::Sin
             | ExprType::Cos
             | ExprType::Tan
             | ExprType::Cot
             | ExprType::Asin
             | ExprType::Acos
+            | ExprType::Acosd
             | ExprType::Atan
             | ExprType::Atan2
             | ExprType::Sind
@@ -287,7 +290,21 @@ impl Strong {
             | ExprType::JsonbPathQueryFirst
             | ExprType::JsonbPopulateRecord
             | ExprType::JsonbToRecord
+            | ExprType::JsonbSet
+            | ExprType::JsonbPopulateMap
+            | ExprType::MapFromEntries
+            | ExprType::MapAccess
+            | ExprType::MapKeys
+            | ExprType::MapValues
+            | ExprType::MapEntries
+            | ExprType::MapFromKeyValues
+            | ExprType::MapCat
+            | ExprType::MapContains
+            | ExprType::MapDelete
+            | ExprType::MapInsert
+            | ExprType::MapLength
             | ExprType::Vnode
+            | ExprType::TestPaidTier
             | ExprType::Proctime
             | ExprType::PgSleep
             | ExprType::PgSleepFor
@@ -300,6 +317,9 @@ impl Strong {
             | ExprType::PgIndexesSize
             | ExprType::PgRelationSize
             | ExprType::PgGetSerialSequence
+            | ExprType::PgIndexColumnHasProperty
+            | ExprType::PgIsInRecovery
+            | ExprType::RwRecoveryStatus
             | ExprType::IcebergTransform
             | ExprType::HasTablePrivilege
             | ExprType::HasAnyColumnPrivilege

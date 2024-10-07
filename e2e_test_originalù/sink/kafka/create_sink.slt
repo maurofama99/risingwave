@@ -2,6 +2,9 @@ statement ok
 set rw_implicit_flush=true;
 
 statement ok
+set sink_decouple = false;
+
+statement ok
 create table t_kafka (
     id integer primary key,
     v_varchar varchar,
@@ -150,7 +153,7 @@ create sink multiple_pk_throttle from t_kafka with (
     topic = 'test-rw-sink-debezium',
     type = 'debezium',
     primary_key = 'id,v_varchar',
-    streaming_rate_limit = 200
+    backfill_rate_limit = 200
 );
 
 statement ok
@@ -162,7 +165,7 @@ create sink multiple_pk_throttle_1
     topic = 'test-rw-sink-debezium',
     type = 'debezium',
     primary_key = 'id,v_varchar',
-    streaming_rate_limit = 200
+    backfill_rate_limit = 200
 );
 
 statement ok
@@ -270,7 +273,7 @@ create sink si_kafka_without_snapshot from t_kafka with (
     snapshot = 'false',
 );
 
-sleep 1s
+sleep 2s
 
 query T
 select rw_key from t_sink_text_id order by rw_key

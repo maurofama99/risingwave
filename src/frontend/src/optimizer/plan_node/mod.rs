@@ -33,15 +33,15 @@ use std::ops::Deref;
 use std::rc::Rc;
 
 use downcast_rs::{impl_downcast, Downcast};
-use dyn_clone::{self, DynClone};
+use dyn_clone::DynClone;
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use paste::paste;
 use pretty_xmlish::{Pretty, PrettyConfig};
 use risingwave_common::catalog::Schema;
 use risingwave_common::util::recursive::{self, Recurse};
-use risingwave_pb::batch_plan::PlanNode as BatchPlanPb;
-use risingwave_pb::stream_plan::StreamNode as StreamPlanPb;
+use risingwave_pb::batch_plan::PlanNode as PbBatchPlan;
+use risingwave_pb::stream_plan::StreamNode as PbStreamPlan;
 use serde::Serialize;
 use smallvec::SmallVec;
 
@@ -49,7 +49,7 @@ use self::batch::BatchPlanRef;
 use self::generic::{GenericPlanRef, PhysicalPlanRef};
 use self::stream::StreamPlanRef;
 use self::utils::Distill;
-use super::property::{Distribution, FunctionalDependencySet, Order};
+use super::property::{Distribution, FunctionalDependencySet, MonotonicityMap, Order};
 use crate::error::{ErrorCode, Result};
 use crate::optimizer::ExpressionSimplifyRewriter;
 use crate::session::current::notice_to_user;
@@ -609,6 +609,10 @@ impl StreamPlanRef for PlanRef {
     fn watermark_columns(&self) -> &FixedBitSet {
         self.plan_base().watermark_columns()
     }
+
+    fn columns_monotonicity(&self) -> &MonotonicityMap {
+        self.plan_base().columns_monotonicity()
+    }
 }
 
 /// Allow access to all fields defined in [`BatchPlanRef`] for the type-erased plan node.
@@ -696,8 +700,10 @@ impl dyn PlanNode {
     }
 }
 
-const PLAN_DEPTH_THRESHOLD: usize = 30;
-const PLAN_TOO_DEEP_NOTICE: &str = "The plan is too deep. \
+/// Recursion depth threshold for plan node visitor to send notice to user.
+pub const PLAN_DEPTH_THRESHOLD: usize = 30;
+/// Notice message for plan node visitor to send to user when the depth threshold is reached.
+pub const PLAN_TOO_DEEP_NOTICE: &str = "The plan is too deep. \
 Consider simplifying or splitting the query if you encounter any issues.";
 
 impl dyn PlanNode {
@@ -708,7 +714,7 @@ impl dyn PlanNode {
     pub fn to_stream_prost(
         &self,
         state: &mut BuildFragmentGraphState,
-    ) -> SchedulerResult<StreamPlanPb> {
+    ) -> SchedulerResult<PbStreamPlan> {
         recursive::tracker!().recurse(|t| {
             if t.depth_reaches(PLAN_DEPTH_THRESHOLD) {
                 notice_to_user(PLAN_TOO_DEEP_NOTICE);
@@ -736,7 +742,7 @@ impl dyn PlanNode {
                 .map(|plan| plan.to_stream_prost(state))
                 .try_collect()?;
             // TODO: support pk_indices and operator_id
-            Ok(StreamPlanPb {
+            Ok(PbStreamPlan {
                 input,
                 identity: self.explain_myself_to_string(),
                 node_body: node,
@@ -754,13 +760,13 @@ impl dyn PlanNode {
     }
 
     /// Serialize the plan node and its children to a batch plan proto.
-    pub fn to_batch_prost(&self) -> SchedulerResult<BatchPlanPb> {
+    pub fn to_batch_prost(&self) -> SchedulerResult<PbBatchPlan> {
         self.to_batch_prost_identity(true)
     }
 
     /// Serialize the plan node and its children to a batch plan proto without the identity field
     /// (for testing).
-    pub fn to_batch_prost_identity(&self, identity: bool) -> SchedulerResult<BatchPlanPb> {
+    pub fn to_batch_prost_identity(&self, identity: bool) -> SchedulerResult<PbBatchPlan> {
         recursive::tracker!().recurse(|t| {
             if t.depth_reaches(PLAN_DEPTH_THRESHOLD) {
                 notice_to_user(PLAN_TOO_DEEP_NOTICE);
@@ -772,7 +778,7 @@ impl dyn PlanNode {
                 .into_iter()
                 .map(|plan| plan.to_batch_prost_identity(identity))
                 .try_collect()?;
-            Ok(BatchPlanPb {
+            Ok(PbBatchPlan {
                 children,
                 identity: if identity {
                     self.explain_myself_to_string()
@@ -848,6 +854,8 @@ mod batch_values;
 mod logical_agg;
 mod logical_apply;
 mod logical_cdc_scan;
+mod logical_changelog;
+mod logical_cte_ref;
 mod logical_dedup;
 mod logical_delete;
 mod logical_except;
@@ -865,6 +873,7 @@ mod logical_now;
 mod logical_over_window;
 mod logical_project;
 mod logical_project_set;
+mod logical_recursive_union;
 mod logical_scan;
 mod logical_share;
 mod logical_source;
@@ -874,6 +883,8 @@ mod logical_topn;
 mod logical_union;
 mod logical_update;
 mod logical_values;
+mod stream_asof_join;
+mod stream_changelog;
 mod stream_dedup;
 mod stream_delta_join;
 mod stream_dml;
@@ -883,16 +894,20 @@ mod stream_exchange;
 mod stream_expand;
 mod stream_filter;
 mod stream_fs_fetch;
+mod stream_global_approx_percentile;
 mod stream_group_topn;
 mod stream_hash_agg;
 mod stream_hash_join;
 mod stream_hop_window;
+mod stream_join_common;
+mod stream_local_approx_percentile;
 mod stream_materialize;
 mod stream_now;
 mod stream_over_window;
 mod stream_project;
 mod stream_project_set;
 mod stream_row_id_gen;
+mod stream_row_merge;
 mod stream_simple_agg;
 mod stream_sink;
 mod stream_sort;
@@ -904,9 +919,11 @@ mod stream_topn;
 mod stream_values;
 mod stream_watermark_filter;
 
+mod batch_file_scan;
 mod batch_iceberg_scan;
 mod batch_kafka_scan;
 mod derive;
+mod logical_file_scan;
 mod logical_iceberg_scan;
 mod stream_cdc_table_scan;
 mod stream_share;
@@ -917,6 +934,7 @@ pub mod utils;
 pub use batch_delete::BatchDelete;
 pub use batch_exchange::BatchExchange;
 pub use batch_expand::BatchExpand;
+pub use batch_file_scan::BatchFileScan;
 pub use batch_filter::BatchFilter;
 pub use batch_group_topn::BatchGroupTopN;
 pub use batch_hash_agg::BatchHashAgg;
@@ -947,10 +965,13 @@ pub use batch_values::BatchValues;
 pub use logical_agg::LogicalAgg;
 pub use logical_apply::LogicalApply;
 pub use logical_cdc_scan::LogicalCdcScan;
+pub use logical_changelog::LogicalChangeLog;
+pub use logical_cte_ref::LogicalCteRef;
 pub use logical_dedup::LogicalDedup;
 pub use logical_delete::LogicalDelete;
 pub use logical_except::LogicalExcept;
 pub use logical_expand::LogicalExpand;
+pub use logical_file_scan::LogicalFileScan;
 pub use logical_filter::LogicalFilter;
 pub use logical_hop_window::LogicalHopWindow;
 pub use logical_iceberg_scan::LogicalIcebergScan;
@@ -965,6 +986,7 @@ pub use logical_now::LogicalNow;
 pub use logical_over_window::LogicalOverWindow;
 pub use logical_project::LogicalProject;
 pub use logical_project_set::LogicalProjectSet;
+pub use logical_recursive_union::LogicalRecursiveUnion;
 pub use logical_scan::LogicalScan;
 pub use logical_share::LogicalShare;
 pub use logical_source::LogicalSource;
@@ -974,7 +996,9 @@ pub use logical_topn::LogicalTopN;
 pub use logical_union::LogicalUnion;
 pub use logical_update::LogicalUpdate;
 pub use logical_values::LogicalValues;
+pub use stream_asof_join::StreamAsOfJoin;
 pub use stream_cdc_table_scan::StreamCdcTableScan;
+pub use stream_changelog::StreamChangeLog;
 pub use stream_dedup::StreamDedup;
 pub use stream_delta_join::StreamDeltaJoin;
 pub use stream_dml::StreamDml;
@@ -984,16 +1008,20 @@ pub use stream_exchange::StreamExchange;
 pub use stream_expand::StreamExpand;
 pub use stream_filter::StreamFilter;
 pub use stream_fs_fetch::StreamFsFetch;
+pub use stream_global_approx_percentile::StreamGlobalApproxPercentile;
 pub use stream_group_topn::StreamGroupTopN;
 pub use stream_hash_agg::StreamHashAgg;
 pub use stream_hash_join::StreamHashJoin;
 pub use stream_hop_window::StreamHopWindow;
+use stream_join_common::StreamJoinCommon;
+pub use stream_local_approx_percentile::StreamLocalApproxPercentile;
 pub use stream_materialize::StreamMaterialize;
 pub use stream_now::StreamNow;
 pub use stream_over_window::StreamOverWindow;
 pub use stream_project::StreamProject;
 pub use stream_project_set::StreamProjectSet;
 pub use stream_row_id_gen::StreamRowIdGen;
+pub use stream_row_merge::StreamRowMerge;
 pub use stream_share::StreamShare;
 pub use stream_simple_agg::StreamSimpleAgg;
 pub use stream_sink::{IcebergPartitionInfo, PartitionComputeInfo, StreamSink};
@@ -1063,6 +1091,10 @@ macro_rules! for_all_plan_nodes {
             , { Logical, MaxOneRow }
             , { Logical, KafkaScan }
             , { Logical, IcebergScan }
+            , { Logical, RecursiveUnion }
+            , { Logical, CteRef }
+            , { Logical, ChangeLog }
+            , { Logical, FileScan }
             , { Batch, SimpleAgg }
             , { Batch, HashAgg }
             , { Batch, SortAgg }
@@ -1093,6 +1125,7 @@ macro_rules! for_all_plan_nodes {
             , { Batch, MaxOneRow }
             , { Batch, KafkaScan }
             , { Batch, IcebergScan }
+            , { Batch, FileScan }
             , { Stream, Project }
             , { Stream, Filter }
             , { Stream, TableScan }
@@ -1126,6 +1159,11 @@ macro_rules! for_all_plan_nodes {
             , { Stream, EowcSort }
             , { Stream, OverWindow }
             , { Stream, FsFetch }
+            , { Stream, ChangeLog }
+            , { Stream, GlobalApproxPercentile }
+            , { Stream, LocalApproxPercentile }
+            , { Stream, RowMerge }
+            , { Stream, AsOfJoin }
         }
     };
 }
@@ -1165,6 +1203,10 @@ macro_rules! for_logical_plan_nodes {
             , { Logical, MaxOneRow }
             , { Logical, KafkaScan }
             , { Logical, IcebergScan }
+            , { Logical, RecursiveUnion }
+            , { Logical, CteRef }
+            , { Logical, ChangeLog }
+            , { Logical, FileScan }
         }
     };
 }
@@ -1204,6 +1246,7 @@ macro_rules! for_batch_plan_nodes {
             , { Batch, MaxOneRow }
             , { Batch, KafkaScan }
             , { Batch, IcebergScan }
+            , { Batch, FileScan }
         }
     };
 }
@@ -1246,6 +1289,11 @@ macro_rules! for_stream_plan_nodes {
             , { Stream, EowcSort }
             , { Stream, OverWindow }
             , { Stream, FsFetch }
+            , { Stream, ChangeLog }
+            , { Stream, GlobalApproxPercentile }
+            , { Stream, LocalApproxPercentile }
+            , { Stream, RowMerge }
+            , { Stream, AsOfJoin }
         }
     };
 }

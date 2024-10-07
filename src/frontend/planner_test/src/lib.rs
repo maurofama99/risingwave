@@ -21,7 +21,7 @@ risingwave_expr_impl::enable!();
 
 mod resolve_id;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ use risingwave_frontend::session::SessionImpl;
 use risingwave_frontend::test_utils::{create_proto_file, get_explain_output, LocalFrontend};
 use risingwave_frontend::{
     build_graph, explain_stream_graph, Binder, Explain, FrontendOpts, OptimizerContext,
-    OptimizerContextRef, PlanRef, Planner, WithOptions,
+    OptimizerContextRef, PlanRef, Planner, WithOptionsSecResolved,
 };
 use risingwave_sqlparser::ast::{
     AstOption, DropMode, EmitMode, ExplainOptions, ObjectName, Statement,
@@ -319,7 +319,7 @@ impl TestCase {
         let object_to_create = if is_table { "TABLE" } else { "SOURCE" };
         format!(
             r#"CREATE {} {}
-    WITH (connector = 'kafka', kafka.topic = 'abc', kafka.servers = 'localhost:1001')
+    WITH (connector = 'kafka', kafka.topic = 'abc', kafka.brokers = 'localhost:1001')
     FORMAT {} ENCODE {} (message = '.test.TestRecord', schema.location = 'file://"#,
             object_to_create, connector_name, connector_format, connector_encode
         )
@@ -568,9 +568,15 @@ impl TestCase {
                 Statement::CreateSchema {
                     schema_name,
                     if_not_exists,
+                    user_specified,
                 } => {
-                    create_schema::handle_create_schema(handler_args, schema_name, if_not_exists)
-                        .await?;
+                    create_schema::handle_create_schema(
+                        handler_args,
+                        schema_name,
+                        if_not_exists,
+                        user_specified,
+                    )
+                    .await?;
                 }
                 _ => return Err(anyhow!("Unsupported statement type")),
             }
@@ -827,10 +833,11 @@ impl TestCase {
             if self.expected_outputs.contains(&TestType::SinkPlan) {
                 let mut plan_root = plan_root.clone();
                 let sink_name = "sink_test";
-                let mut options = HashMap::new();
+                let mut options = BTreeMap::new();
                 options.insert("connector".to_string(), "blackhole".to_string());
                 options.insert("type".to_string(), "append-only".to_string());
-                let options = WithOptions::new(options);
+                // let options = WithOptionsSecResolved::without_secrets(options);
+                let options = WithOptionsSecResolved::without_secrets(options);
                 let format_desc = (&options).try_into().unwrap();
                 match plan_root.gen_sink_plan(
                     sink_name.to_string(),

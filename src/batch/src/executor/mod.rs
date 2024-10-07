@@ -27,11 +27,13 @@ mod limit;
 mod log_row_seq_scan;
 mod managed;
 mod max_one_row;
+mod merge_sort;
 mod merge_sort_exchange;
 mod order_by;
 mod project;
 mod project_set;
 mod row_seq_scan;
+mod s3_file_scan;
 mod sort_agg;
 mod sort_over_window;
 mod source;
@@ -60,6 +62,7 @@ pub use join::*;
 pub use limit::*;
 pub use managed::*;
 pub use max_one_row::*;
+pub use merge_sort::*;
 pub use merge_sort_exchange::*;
 pub use order_by::*;
 pub use project::*;
@@ -84,6 +87,7 @@ pub use values::*;
 use self::log_row_seq_scan::LogStoreRowSeqScanExecutorBuilder;
 use self::test_utils::{BlockExecutorBuilder, BusyLoopExecutorBuilder};
 use crate::error::Result;
+use crate::executor::s3_file_scan::FileScanExecutorBuilder;
 use crate::executor::sys_row_seq_scan::SysRowSeqScanExecutorBuilder;
 use crate::task::{BatchTaskContext, ShutdownToken, TaskId};
 
@@ -170,7 +174,7 @@ impl<'a, C: Clone> ExecutorBuilder<'a, C> {
             plan_node,
             self.task_id,
             self.context.clone(),
-            self.epoch.clone(),
+            self.epoch,
             self.shutdown_rx.clone(),
         )
     }
@@ -184,7 +188,7 @@ impl<'a, C: Clone> ExecutorBuilder<'a, C> {
     }
 
     pub fn epoch(&self) -> BatchQueryEpoch {
-        self.epoch.clone()
+        self.epoch
     }
 }
 
@@ -238,6 +242,8 @@ impl<'a, C: BatchTaskContext> ExecutorBuilder<'a, C> {
             NodeBody::Source => SourceExecutor,
             NodeBody::SortOverWindow => SortOverWindowExecutor,
             NodeBody::MaxOneRow => MaxOneRowExecutor,
+            NodeBody::FileScan => FileScanExecutorBuilder,
+            NodeBody::IcebergScan => IcebergScanExecutorBuilder,
             // Follow NodeBody only used for test
             NodeBody::BlockExecutor => BlockExecutorBuilder,
             NodeBody::BusyLoopExecutor => BusyLoopExecutorBuilder,
@@ -254,14 +260,14 @@ impl<'a, C: BatchTaskContext> ExecutorBuilder<'a, C> {
 
 #[cfg(test)]
 mod tests {
-    use risingwave_hummock_sdk::to_committed_batch_query_epoch;
+    use risingwave_hummock_sdk::test_batch_query_epoch;
     use risingwave_pb::batch_plan::PlanNode;
 
     use crate::executor::ExecutorBuilder;
     use crate::task::{ComputeNodeContext, ShutdownToken, TaskId};
 
-    #[test]
-    fn test_clone_for_plan() {
+    #[tokio::test]
+    async fn test_clone_for_plan() {
         let plan_node = PlanNode::default();
         let task_id = &TaskId {
             task_id: 1,
@@ -272,7 +278,7 @@ mod tests {
             &plan_node,
             task_id,
             ComputeNodeContext::for_test(),
-            to_committed_batch_query_epoch(u64::MAX),
+            test_batch_query_epoch(),
             ShutdownToken::empty(),
         );
         let child_plan = &PlanNode::default();

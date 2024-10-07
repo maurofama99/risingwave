@@ -33,6 +33,7 @@ use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{CollectInputRef, Expr, ExprImpl, ExprRewriter, ExprType, ExprVisitor, InputRef};
 use crate::optimizer::plan_node::expr_visitable::ExprVisitable;
 use crate::optimizer::plan_node::generic::DynamicFilter;
+use crate::optimizer::plan_node::stream_asof_join::StreamAsOfJoin;
 use crate::optimizer::plan_node::utils::IndicesDisplay;
 use crate::optimizer::plan_node::{
     BatchHashJoin, BatchLookupJoin, BatchNestedLoopJoin, ColumnPruningContext, EqJoinPredicate,
@@ -133,7 +134,7 @@ impl LogicalJoin {
             .collect_input_refs(self.core.left.schema().len() + self.core.right.schema().len());
         let index_group = input_refs
             .ones()
-            .group_by(|i| *i < self.core.left.schema().len());
+            .chunk_by(|i| *i < self.core.left.schema().len());
         let left_index = index_group
             .into_iter()
             .next()
@@ -418,6 +419,7 @@ impl LogicalJoin {
             .collect_vec();
 
         let new_scan_output_column_ids = new_scan.output_column_ids();
+        let as_of = new_scan.as_of.clone();
 
         // Construct a new logical join, because we have change its RHS.
         let new_logical_join = generic::Join::new(
@@ -435,6 +437,7 @@ impl LogicalJoin {
             new_scan_output_column_ids,
             lookup_prefix_len,
             false,
+            as_of,
         ))
     }
 
@@ -835,14 +838,13 @@ impl PredicatePushdown for LogicalJoin {
 }
 
 impl LogicalJoin {
-    fn to_stream_hash_join(
+    fn get_stream_input_for_hash_join(
         &self,
-        predicate: EqJoinPredicate,
+        predicate: &EqJoinPredicate,
         ctx: &mut ToStreamContext,
-    ) -> Result<PlanRef> {
+    ) -> Result<(PlanRef, PlanRef)> {
         use super::stream::prelude::*;
 
-        assert!(predicate.has_eq());
         let mut right = self.right().to_stream_with_dist_required(
             &RequiredDist::shard_by_key(self.right().schema().len(), &predicate.right_eq_indexes()),
             ctx,
@@ -886,6 +888,18 @@ impl LogicalJoin {
             }
             _ => unreachable!(),
         }
+        Ok((left, right))
+    }
+
+    fn to_stream_hash_join(
+        &self,
+        predicate: EqJoinPredicate,
+        ctx: &mut ToStreamContext,
+    ) -> Result<PlanRef> {
+        use super::stream::prelude::*;
+
+        assert!(predicate.has_eq());
+        let (left, right) = self.get_stream_input_for_hash_join(&predicate, ctx)?;
 
         let logical_join = self.clone_with_left_right(left, right);
 
@@ -1258,10 +1272,45 @@ impl LogicalJoin {
             .expect("Fail to convert to lookup join")
             .into())
     }
+
+    fn to_stream_asof_join(
+        &self,
+        predicate: EqJoinPredicate,
+        ctx: &mut ToStreamContext,
+    ) -> Result<StreamAsOfJoin> {
+        use super::stream::prelude::*;
+
+        if predicate.eq_keys().is_empty() {
+            return Err(ErrorCode::InvalidInputSyntax(
+                "AsOf join requires at least 1 equal condition".to_string(),
+            )
+            .into());
+        }
+
+        let (left, right) = self.get_stream_input_for_hash_join(&predicate, ctx)?;
+        let left_len = left.schema().len();
+        let logical_join = self.clone_with_left_right(left, right);
+
+        let inequality_desc =
+            StreamAsOfJoin::get_inequality_desc_from_predicate(predicate.clone(), left_len)?;
+
+        Ok(StreamAsOfJoin::new(
+            logical_join.core.clone(),
+            predicate,
+            inequality_desc,
+        ))
+    }
 }
 
 impl ToBatch for LogicalJoin {
     fn to_batch(&self) -> Result<PlanRef> {
+        if JoinType::AsofInner == self.join_type() || JoinType::AsofLeftOuter == self.join_type() {
+            return Err(ErrorCode::NotSupported(
+                "AsOf join in batch query".to_string(),
+                "AsOf join is only supported in streaming query".to_string(),
+            )
+            .into());
+        }
         let predicate = EqJoinPredicate::create(
             self.left().schema().len(),
             self.right().schema().len(),
@@ -1318,7 +1367,9 @@ impl ToStream for LogicalJoin {
             self.on().clone(),
         );
 
-        if predicate.has_eq() {
+        if self.join_type() == JoinType::AsofInner || self.join_type() == JoinType::AsofLeftOuter {
+            self.to_stream_asof_join(predicate, ctx).map(|x| x.into())
+        } else if predicate.has_eq() {
             if !predicate.eq_keys_are_type_aligned() {
                 return Err(ErrorCode::InternalError(format!(
                     "Join eq keys are not aligned for predicate: {predicate:?}"
@@ -1451,7 +1502,7 @@ impl ToStream for LogicalJoin {
                 )
                 .collect_vec();
             let plan: PlanRef = join_with_pk.into();
-            LogicalFilter::filter_if_keys_all_null(plan, &left_right_stream_keys)
+            LogicalFilter::filter_out_all_null_keys(plan, &left_right_stream_keys)
         } else {
             join_with_pk.into()
         };
@@ -1471,7 +1522,7 @@ mod tests {
     use risingwave_pb::expr::expr_node::Type;
 
     use super::*;
-    use crate::expr::{assert_eq_input_ref, FunctionCall, InputRef, Literal};
+    use crate::expr::{assert_eq_input_ref, FunctionCall, Literal};
     use crate::optimizer::optimizer_context::OptimizerContext;
     use crate::optimizer::plan_node::LogicalValues;
     use crate::optimizer::property::FunctionalDependency;

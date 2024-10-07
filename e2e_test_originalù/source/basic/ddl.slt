@@ -4,8 +4,9 @@ create source s;
 db error: ERROR: Failed to run the query
 
 Caused by:
-  sql parser error: Expected description of the format, found: ; at line:1, column:17
-Near "create source s"
+  sql parser error: expected description of the format, found: ;
+LINE 1: create source s;
+                       ^
 
 
 statement error missing WITH clause
@@ -52,7 +53,7 @@ create source s (
   properties.bootstrap.server = 'message_queue:29092'
 ) FORMAT PLAIN ENCODE JSON;
 
-statement error properties `scan_startup_mode` only support earliest and latest or leave it empty
+statement error properties `scan_startup_mode` only supports earliest and latest or leaving it empty
 create source invalid_startup_mode (
   column1 varchar
 ) with (
@@ -187,7 +188,7 @@ create table s (
 query T
 show sources
 ----
-
+s
 
 query T
 show tables

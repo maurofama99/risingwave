@@ -18,6 +18,8 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use num_integer::Integer;
 use risingwave_common::hash::VirtualNode;
 use risingwave_hummock_sdk::key::{FullKey, UserKey};
@@ -29,8 +31,8 @@ use crate::hummock::sstable::filter::FilterBuilder;
 use crate::hummock::sstable_store::SstableStoreRef;
 use crate::hummock::value::HummockValue;
 use crate::hummock::{
-    BatchUploadWriter, BlockMeta, CachePolicy, HummockResult, MemoryLimiter, SstableBuilder,
-    SstableBuilderOptions, SstableWriter, SstableWriterOptions, Xor16FilterBuilder,
+    BatchUploadWriter, BlockMeta, CachePolicy, HummockError, HummockResult, MemoryLimiter,
+    SstableBuilder, SstableBuilderOptions, SstableWriter, SstableWriterOptions, Xor16FilterBuilder,
 };
 use crate::monitor::CompactorMetrics;
 
@@ -41,11 +43,6 @@ pub trait TableBuilderFactory {
     type Writer: SstableWriter<Output = UploadJoinHandle>;
     type Filter: FilterBuilder;
     async fn open_builder(&mut self) -> HummockResult<SstableBuilder<Self::Writer, Self::Filter>>;
-}
-
-pub struct SplitTableOutput {
-    pub sst_info: LocalSstableInfo,
-    pub upload_join_handle: UploadJoinHandle,
 }
 
 /// A wrapper for [`SstableBuilder`] which automatically split key-value pairs into multiple tables,
@@ -59,7 +56,7 @@ where
     /// When creating a new [`SstableBuilder`], caller use this factory to generate it.
     builder_factory: F,
 
-    sst_outputs: Vec<SplitTableOutput>,
+    sst_outputs: Vec<LocalSstableInfo>,
 
     current_builder: Option<SstableBuilder<F::Writer, F::Filter>>,
 
@@ -70,11 +67,17 @@ where
     task_progress: Option<Arc<TaskProgress>>,
 
     last_table_id: u32,
-    table_partition_vnode: BTreeMap<u32, u32>,
+
+    vnode_count: usize,
+    table_vnode_partition: BTreeMap<u32, u32>,
     split_weight_by_vnode: u32,
     /// When vnode of the coming key is greater than `largest_vnode_in_current_partition`, we will
     /// switch SST.
     largest_vnode_in_current_partition: usize,
+
+    concurrent_upload_join_handle: FuturesUnordered<UploadJoinHandle>,
+
+    concurrent_uploading_sst_count: Option<usize>,
 }
 
 impl<F> CapacitySplitTableBuilder<F>
@@ -87,8 +90,12 @@ where
         builder_factory: F,
         compactor_metrics: Arc<CompactorMetrics>,
         task_progress: Option<Arc<TaskProgress>>,
-        table_partition_vnode: BTreeMap<u32, u32>,
+        table_vnode_partition: BTreeMap<u32, u32>,
+        concurrent_uploading_sst_count: Option<usize>,
     ) -> Self {
+        // TODO(var-vnode): should use value from caller
+        let vnode_count = VirtualNode::COUNT_FOR_COMPAT;
+
         Self {
             builder_factory,
             sst_outputs: Vec::new(),
@@ -96,9 +103,12 @@ where
             compactor_metrics,
             task_progress,
             last_table_id: 0,
-            table_partition_vnode,
+            table_vnode_partition,
+            vnode_count,
             split_weight_by_vnode: 0,
-            largest_vnode_in_current_partition: VirtualNode::MAX.to_index(),
+            largest_vnode_in_current_partition: vnode_count - 1,
+            concurrent_upload_join_handle: FuturesUnordered::new(),
+            concurrent_uploading_sst_count,
         }
     }
 
@@ -110,9 +120,12 @@ where
             compactor_metrics: Arc::new(CompactorMetrics::unused()),
             task_progress: None,
             last_table_id: 0,
-            table_partition_vnode: BTreeMap::default(),
+            table_vnode_partition: BTreeMap::default(),
+            vnode_count: VirtualNode::COUNT_FOR_TEST,
             split_weight_by_vnode: 0,
-            largest_vnode_in_current_partition: VirtualNode::MAX.to_index(),
+            largest_vnode_in_current_partition: VirtualNode::MAX_FOR_TEST.to_index(),
+            concurrent_upload_join_handle: FuturesUnordered::new(),
+            concurrent_uploading_sst_count: None,
         }
     }
 
@@ -207,10 +220,10 @@ where
         let mut switch_builder = false;
         if user_key.table_id.table_id != self.last_table_id {
             let new_vnode_partition_count =
-                self.table_partition_vnode.get(&user_key.table_id.table_id);
+                self.table_vnode_partition.get(&user_key.table_id.table_id);
 
             if new_vnode_partition_count.is_some()
-                || self.table_partition_vnode.contains_key(&self.last_table_id)
+                || self.table_vnode_partition.contains_key(&self.last_table_id)
             {
                 if new_vnode_partition_count.is_some() {
                     self.split_weight_by_vnode = *new_vnode_partition_count.unwrap();
@@ -223,22 +236,23 @@ where
                 switch_builder = true;
                 if self.split_weight_by_vnode > 1 {
                     self.largest_vnode_in_current_partition =
-                        VirtualNode::COUNT / (self.split_weight_by_vnode as usize) - 1;
+                        self.vnode_count / (self.split_weight_by_vnode as usize) - 1;
                 } else {
                     // default
-                    self.largest_vnode_in_current_partition = VirtualNode::MAX.to_index();
+                    self.largest_vnode_in_current_partition = self.vnode_count - 1;
                 }
             }
         }
-        if self.largest_vnode_in_current_partition != VirtualNode::MAX.to_index() {
+        if self.largest_vnode_in_current_partition != self.vnode_count - 1 {
             let key_vnode = user_key.get_vnode_id();
             if key_vnode > self.largest_vnode_in_current_partition {
                 // vnode partition change
                 switch_builder = true;
 
                 // SAFETY: `self.split_weight_by_vnode > 1` here.
-                let (basic, remainder) =
-                    VirtualNode::COUNT.div_rem(&(self.split_weight_by_vnode as usize));
+                let (basic, remainder) = self
+                    .vnode_count
+                    .div_rem(&(self.split_weight_by_vnode as usize));
                 let small_segments_area = basic * (self.split_weight_by_vnode as usize - remainder);
                 self.largest_vnode_in_current_partition = (if key_vnode < small_segments_area {
                     (key_vnode / basic + 1) * basic
@@ -264,6 +278,7 @@ where
     /// If there's no builder created, or current one is already sealed before, then this function
     /// will be no-op.
     pub async fn seal_current(&mut self) -> HummockResult<()> {
+        use await_tree::InstrumentAwait;
         if let Some(builder) = self.current_builder.take() {
             let builder_output = builder.finish().await?;
             {
@@ -271,48 +286,38 @@ where
                 if let Some(progress) = &self.task_progress {
                     progress.inc_ssts_sealed();
                 }
-
-                if builder_output.bloom_filter_size != 0 {
-                    self.compactor_metrics
-                        .sstable_bloom_filter_size
-                        .observe(builder_output.bloom_filter_size as _);
-                }
-
-                if builder_output.sst_info.file_size() != 0 {
-                    self.compactor_metrics
-                        .sstable_file_size
-                        .observe(builder_output.sst_info.file_size() as _);
-                }
-
-                if builder_output.avg_key_size != 0 {
-                    self.compactor_metrics
-                        .sstable_avg_key_size
-                        .observe(builder_output.avg_key_size as _);
-                }
-
-                if builder_output.avg_value_size != 0 {
-                    self.compactor_metrics
-                        .sstable_avg_value_size
-                        .observe(builder_output.avg_value_size as _);
-                }
-
-                if builder_output.epoch_count != 0 {
-                    self.compactor_metrics
-                        .sstable_distinct_epoch_count
-                        .observe(builder_output.epoch_count as _);
-                }
+                builder_output.stats.report_stats(&self.compactor_metrics);
             }
-            self.sst_outputs.push(SplitTableOutput {
-                upload_join_handle: builder_output.writer_output,
-                sst_info: builder_output.sst_info,
-            });
+
+            self.concurrent_upload_join_handle
+                .push(builder_output.writer_output);
+
+            self.sst_outputs.push(builder_output.sst_info);
+
+            if let Some(concurrent_uploading_sst_count) = self.concurrent_uploading_sst_count
+                && self.concurrent_upload_join_handle.len() >= concurrent_uploading_sst_count
+            {
+                self.concurrent_upload_join_handle
+                    .next()
+                    .verbose_instrument_await("upload")
+                    .await
+                    .unwrap()
+                    .map_err(HummockError::sstable_upload_error)??;
+            }
         }
         Ok(())
     }
 
     /// Finalizes all the tables to be ids, blocks and metadata.
-    pub async fn finish(mut self) -> HummockResult<Vec<SplitTableOutput>> {
+    pub async fn finish(mut self) -> HummockResult<Vec<LocalSstableInfo>> {
+        use futures::future::try_join_all;
         self.seal_current().await?;
+        try_join_all(self.concurrent_upload_join_handle.into_iter())
+            .await
+            .map_err(HummockError::sstable_upload_error)?
+            .into_iter()
+            .collect::<HummockResult<Vec<()>>>()?;
+
         Ok(self.sst_outputs)
     }
 }
@@ -370,13 +375,12 @@ impl TableBuilderFactory for LocalTableBuilderFactory {
 #[cfg(test)]
 mod tests {
     use risingwave_common::catalog::TableId;
-    use risingwave_common::hash::VirtualNode;
     use risingwave_common::util::epoch::{test_epoch, EpochExt};
 
     use super::*;
     use crate::hummock::iterator::test_utils::mock_sstable_store;
     use crate::hummock::test_utils::{default_builder_opt_for_test, test_key_of, test_user_key_of};
-    use crate::hummock::{SstableBuilderOptions, DEFAULT_RESTART_INTERVAL};
+    use crate::hummock::DEFAULT_RESTART_INTERVAL;
 
     #[tokio::test]
     async fn test_empty() {
@@ -505,6 +509,7 @@ mod tests {
             Arc::new(CompactorMetrics::unused()),
             None,
             table_partition_vnode,
+            None,
         );
 
         let mut table_key = VirtualNode::from_index(0).to_be_bytes().to_vec();

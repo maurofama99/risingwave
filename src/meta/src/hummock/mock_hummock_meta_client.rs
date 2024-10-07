@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -21,8 +22,12 @@ use async_trait::async_trait;
 use fail::fail_point;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
+use itertools::Itertools;
+use risingwave_common::catalog::TableId;
 use risingwave_hummock_sdk::change_log::build_table_change_log_delta;
+use risingwave_hummock_sdk::compact_task::CompactTask;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::version::HummockVersion;
 use risingwave_hummock_sdk::{
     HummockContextId, HummockEpoch, HummockSstableObjectId, HummockVersionId, LocalSstableInfo,
@@ -33,7 +38,7 @@ use risingwave_pb::hummock::compact_task::TaskStatus;
 use risingwave_pb::hummock::subscribe_compaction_event_request::{Event, ReportTask};
 use risingwave_pb::hummock::subscribe_compaction_event_response::Event as ResponseEvent;
 use risingwave_pb::hummock::{
-    compact_task, CompactTask, HummockSnapshot, SubscribeCompactionEventRequest,
+    compact_task, PbHummockVersion, SubscribeCompactionEventRequest,
     SubscribeCompactionEventResponse, VacuumTask,
 };
 use risingwave_rpc_client::error::{Result, RpcError};
@@ -46,7 +51,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::hummock::compaction::selector::{
     default_compaction_selector, CompactionSelector, SpaceReclaimCompactionSelector,
 };
-use crate::hummock::{CommitEpochInfo, HummockManager};
+use crate::hummock::{CommitEpochInfo, HummockManager, NewTableFragmentInfo};
 
 pub struct MockHummockMetaClient {
     hummock_manager: Arc<HummockManager>,
@@ -91,6 +96,10 @@ impl MockHummockMetaClient {
             .await
             .unwrap_or(None)
     }
+
+    pub fn context_id(&self) -> HummockContextId {
+        self.context_id
+    }
 }
 
 fn mock_err(error: super::error::Error) -> RpcError {
@@ -110,37 +119,6 @@ impl HummockMetaClient for MockHummockMetaClient {
         Ok(self.hummock_manager.get_current_version().await)
     }
 
-    async fn pin_snapshot(&self) -> Result<HummockSnapshot> {
-        self.hummock_manager
-            .pin_snapshot(self.context_id)
-            .await
-            .map_err(mock_err)
-    }
-
-    async fn get_snapshot(&self) -> Result<HummockSnapshot> {
-        Ok(self.hummock_manager.latest_snapshot())
-    }
-
-    async fn unpin_snapshot(&self) -> Result<()> {
-        self.hummock_manager
-            .unpin_snapshot(self.context_id)
-            .await
-            .map_err(mock_err)
-    }
-
-    async fn unpin_snapshot_before(&self, pinned_epochs: HummockEpoch) -> Result<()> {
-        self.hummock_manager
-            .unpin_snapshot_before(
-                self.context_id,
-                HummockSnapshot {
-                    committed_epoch: pinned_epochs,
-                    current_epoch: pinned_epochs,
-                },
-            )
-            .await
-            .map_err(mock_err)
-    }
-
     async fn get_new_sst_ids(&self, number: u32) -> Result<SstObjectIdRange> {
         fail_point!("get_new_sst_ids_err", |_| Err(anyhow!(
             "failpoint get_new_sst_ids_err"
@@ -156,14 +134,70 @@ impl HummockMetaClient for MockHummockMetaClient {
             })
     }
 
-    async fn commit_epoch(&self, epoch: HummockEpoch, sync_result: SyncResult) -> Result<()> {
+    async fn commit_epoch(
+        &self,
+        epoch: HummockEpoch,
+        sync_result: SyncResult,
+        is_log_store: bool,
+    ) -> Result<()> {
         let version: HummockVersion = self.hummock_manager.get_current_version().await;
-        let sst_to_worker = sync_result
+        let table_ids = version
+            .state_table_info
+            .info()
+            .keys()
+            .map(|table_id| table_id.table_id)
+            .collect::<BTreeSet<_>>();
+
+        let old_value_ssts_vec = if is_log_store {
+            sync_result.old_value_ssts.clone()
+        } else {
+            vec![]
+        };
+        let commit_table_ids = sync_result
             .uncommitted_ssts
             .iter()
-            .map(|LocalSstableInfo { sst_info, .. }| (sst_info.get_object_id(), self.context_id))
+            .flat_map(|sstable| sstable.sst_info.table_ids.clone())
+            .chain({
+                old_value_ssts_vec
+                    .iter()
+                    .flat_map(|sstable| sstable.sst_info.table_ids.clone())
+            })
+            .chain(
+                sync_result
+                    .table_watermarks
+                    .keys()
+                    .map(|table_id| table_id.table_id),
+            )
+            .chain(table_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+
+        let new_table_fragment_info = if commit_table_ids
+            .iter()
+            .all(|table_id| table_ids.contains(table_id))
+        {
+            NewTableFragmentInfo::None
+        } else {
+            NewTableFragmentInfo::Normal {
+                mv_table_id: None,
+                internal_table_ids: commit_table_ids
+                    .iter()
+                    .cloned()
+                    .map(TableId::from)
+                    .collect_vec(),
+            }
+        };
+
+        let sst_to_context = sync_result
+            .uncommitted_ssts
+            .iter()
+            .map(|LocalSstableInfo { sst_info, .. }| (sst_info.object_id, self.context_id))
             .collect();
         let new_table_watermark = sync_result.table_watermarks;
+        let table_change_log_table_ids = if is_log_store {
+            commit_table_ids.clone()
+        } else {
+            BTreeSet::new()
+        };
         let table_change_log = build_table_change_log_delta(
             sync_result
                 .old_value_ssts
@@ -171,33 +205,27 @@ impl HummockMetaClient for MockHummockMetaClient {
                 .map(|sst| sst.sst_info),
             sync_result.uncommitted_ssts.iter().map(|sst| &sst.sst_info),
             &vec![epoch],
-            version
-                .levels
-                .values()
-                .flat_map(|group| group.member_table_ids.iter().map(|table_id| (*table_id, 0))),
+            table_change_log_table_ids
+                .into_iter()
+                .map(|table_id| (table_id, 0)),
         );
+
         self.hummock_manager
-            .commit_epoch(
-                epoch,
-                CommitEpochInfo::new(
-                    sync_result
-                        .uncommitted_ssts
-                        .into_iter()
-                        .map(|sst| sst.into())
-                        .collect(),
-                    new_table_watermark,
-                    sst_to_worker,
-                    None,
-                    table_change_log,
-                ),
-            )
+            .commit_epoch(CommitEpochInfo {
+                sstables: sync_result.uncommitted_ssts,
+                new_table_watermarks: new_table_watermark,
+                sst_to_context,
+                new_table_fragment_info,
+                change_log_delta: table_change_log,
+                committed_epoch: epoch,
+                tables_to_commit: commit_table_ids
+                    .iter()
+                    .cloned()
+                    .map(TableId::from)
+                    .collect(),
+            })
             .await
             .map_err(mock_err)?;
-        Ok(())
-    }
-
-    async fn update_current_epoch(&self, epoch: HummockEpoch) -> Result<()> {
-        self.hummock_manager.update_current_epoch(epoch);
         Ok(())
     }
 
@@ -220,11 +248,16 @@ impl HummockMetaClient for MockHummockMetaClient {
         _filtered_object_ids: Vec<HummockSstableObjectId>,
         _total_object_count: u64,
         _total_object_size: u64,
+        _next_start_after: Option<String>,
     ) -> Result<()> {
         unimplemented!()
     }
 
-    async fn trigger_full_gc(&self, _sst_retention_time_sec: u64) -> Result<()> {
+    async fn trigger_full_gc(
+        &self,
+        _sst_retention_time_sec: u64,
+        _prefix: Option<String>,
+    ) -> Result<()> {
         unimplemented!()
     }
 
@@ -289,7 +322,7 @@ impl HummockMetaClient for MockHummockMetaClient {
                     .unwrap()
                 {
                     let resp = SubscribeCompactionEventResponse {
-                        event: Some(ResponseEvent::CompactTask(task)),
+                        event: Some(ResponseEvent::CompactTask(task.into())),
                         create_at: SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .expect("Clock may have gone backwards")
@@ -319,7 +352,10 @@ impl HummockMetaClient for MockHummockMetaClient {
                             .report_compact_task(
                                 task_id,
                                 TaskStatus::try_from(task_status).unwrap(),
-                                sorted_output_ssts,
+                                sorted_output_ssts
+                                    .into_iter()
+                                    .map(SstableInfo::from)
+                                    .collect_vec(),
                                 Some(table_stats_change),
                             )
                             .await
@@ -340,6 +376,14 @@ impl HummockMetaClient for MockHummockMetaClient {
                 _handle: join_handle_vec,
             }),
         ))
+    }
+
+    async fn get_version_by_epoch(
+        &self,
+        _epoch: HummockEpoch,
+        _table_id: u32,
+    ) -> Result<PbHummockVersion> {
+        unimplemented!()
     }
 }
 
