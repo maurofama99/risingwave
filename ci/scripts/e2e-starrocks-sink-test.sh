@@ -40,7 +40,7 @@ GRANT ALL ON *.* TO 'users'@'%';"
 sleep 2
 
 echo "--- testing sinks"
-sqllogictest -p 4566 -d dev './e2e_test/sink/starrocks_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/starrocks_sink.slt'
 sleep 1
 mysql -uroot -P 9030 -h starrocks-fe-server -e "select * from demo.demo_bhv_table" > ./query_result.csv
 

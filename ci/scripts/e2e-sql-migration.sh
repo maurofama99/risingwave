@@ -52,7 +52,7 @@ RUST_LOG="info,risingwave_stream=info,risingwave_batch=info,risingwave_storage=i
 risedev ci-start ci-1cn-1fe-with-recovery
 
 echo "--- init cluster with some data & DDL"
-sqllogictest -d dev -h localhost -p 4566 './e2e_test/sql_migration/prepare.slt'
+sqllogictest -d dev -h localhost -p 4566 './e2e_test_originalù/sql_migration/prepare.slt'
 
 echo "--- kill cluster"
 risedev ci-kill
@@ -79,7 +79,7 @@ echo "--- wait for recovery"
 wait_for_recovery
 
 echo "--- run check"
-sqllogictest -d dev -h localhost -p 4566 './e2e_test/sql_migration/check.slt'
+sqllogictest -d dev -h localhost -p 4566 './e2e_test_originalù/sql_migration/check.slt'
 
 echo "--- kill cluster"
 risedev kill

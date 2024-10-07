@@ -41,7 +41,7 @@ GRANT ALL ON *.* TO 'users'@'%';"
 sleep 2
 
 echo "--- testing sinks"
-sqllogictest -p 4566 -d dev './e2e_test/sink/doris_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/doris_sink.slt'
 sleep 1
 mysql -uroot -P 9030 -h doris-server -e "select * from demo.demo_bhv_table" > ./query_result.csv
 

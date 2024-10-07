@@ -1,0 +1,8 @@
+#[serde(default = "default::developer::memory_controller_eviction_factor_aggressive")]
+memory_controller_eviction_factor_aggressive = 0.3
+
+#[serde(default = "default::developer::memory_controller_eviction_factor_graceful")]
+memory_controller_eviction_factor_graceful = 0.2
+
+#[serde(default = "default::developer::memory_controller_eviction_factor_stable")]
+memory_controller_eviction_factor_stable = 0.1

@@ -147,7 +147,7 @@ pub fn timestamptz_interval_add(
     let mut t = input;
     if !qualitative.is_zero() {
         // Only convert into and from naive local when necessary because it is lossy.
-        // See `e2e_test/batch/functions/issue_12072.slt.part` for the difference.
+        // See `e2e_test_originalù/batch/functions/issue_12072.slt.part` for the difference.
         let naive = timestamptz_at_time_zone(t, time_zone)?;
         let naive = naive
             .checked_add(qualitative)

@@ -1,7 +1,0 @@
-query TI
-select
-  s_name,
-  numwait
-from tpch_q21;
-----
-Supplier#000000005 15

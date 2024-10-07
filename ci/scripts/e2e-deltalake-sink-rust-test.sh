@@ -52,7 +52,7 @@ spark-3.3.1-bin-hadoop3/bin/spark-sql --packages $DEPENDENCIES \
 
 
 echo "--- testing sinks"
-sqllogictest -p 4566 -d dev './e2e_test/sink/deltalake_rust_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/deltalake_rust_sink.slt'
 sleep 1
 
 

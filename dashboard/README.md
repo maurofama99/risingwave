@@ -33,8 +33,8 @@ For example:
 
 ```bash
 ./risedev d
-sqllogictest -p 4566 -d dev './e2e_test/nexmark/create_tables.slt.part'
-sqllogictest -p 4566 -d dev './e2e_test/streaming/nexmark/create_views.slt.part'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/nexmark/create_tables.slt.part'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/streaming/nexmark/create_views.slt.part'
 ```
 
 Install dependencies and start the development server.

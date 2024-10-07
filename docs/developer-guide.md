@@ -119,7 +119,7 @@ Then you'll be able to compile and start RiseDev!
 > If the default `python3` version is not 3.12, please set the `PYO3_PYTHON` environment variable:
 >
 > ```shell
-> export PYO3_PYTHON=python3.12
+> export PYO3_PYTHON=python3.7
 > ```
 
 ## Start and monitor a dev cluster
@@ -363,9 +363,9 @@ Alternatively, you can also run some specific tests:
 
 ```shell
 # run a single test
-./risedev slt -p 4566 -d dev './e2e_test/path/to/file.slt'
+./risedev slt -p 4566 -d dev './e2e_test_originalù/path/to/file.slt'
 # run all tests under a directory (including subdirectories)
-./risedev slt -p 4566 -d dev './e2e_test/path/to/directory/**/*.slt'
+./risedev slt -p 4566 -d dev './e2e_test_originalù/path/to/directory/**/*.slt'
 ```
 
 After running e2e tests, you may kill the cluster and clean data.
@@ -406,7 +406,7 @@ As introduced in [#5117](https://github.com/risingwavelabs/risingwave/issues/511
 # run all generated e2e tests
 ./risedev slt-generated -p 4566 -d dev
 # or, run only some of them
-./risedev slt -p 4566 -d dev './e2e_test/generated/docslt/risingwave_expr/**/*.slt'
+./risedev slt -p 4566 -d dev './e2e_test_originalù/generated/docslt/risingwave_expr/**/*.slt'
 ```
 
 These will be run on CI as well.
@@ -422,7 +422,7 @@ In RisingWave, deterministic simulation is supported in both unit test and end-t
 # run deterministic unit test
 ./risedev stest
 # run deterministic end-to-end test
-./risedev sslt -- './e2e_test/path/to/directory/**/*.slt'
+./risedev sslt -- './e2e_test_originalù/path/to/directory/**/*.slt'
 ```
 
 When your program panics, the simulator will print the random seed of this run:
@@ -436,7 +436,7 @@ Then you can reproduce the bug with the given seed:
 
 ```sh
 # set the random seed to reproduce a run
-MADSIM_TEST_SEED=1 RUST_LOG=info ./risedev sslt -- './e2e_test/path/to/directory/**/*.slt'
+MADSIM_TEST_SEED=1 RUST_LOG=info ./risedev sslt -- './e2e_test_originalù/path/to/directory/**/*.slt'
 ```
 
 More advanced usages are listed below:
@@ -444,13 +444,13 @@ More advanced usages are listed below:
 ```sh
 # run multiple times with different seeds to test reliability
 # it's recommended to build in release mode for a fast run
-MADSIM_TEST_NUM=100 ./risedev sslt --release -- './e2e_test/path/to/directory/**/*.slt'
+MADSIM_TEST_NUM=100 ./risedev sslt --release -- './e2e_test_originalù/path/to/directory/**/*.slt'
 
 # configure cluster nodes (by default: 2fe+3cn)
-./risedev sslt -- --compute-nodes 2 './e2e_test/path/to/directory/**/*.slt'
+./risedev sslt -- --compute-nodes 2 './e2e_test_originalù/path/to/directory/**/*.slt'
 
 # inject failures to test fault recovery
-./risedev sslt -- --kill-meta --etcd-timeout-rate=0.01 './e2e_test/path/to/directory/**/*.slt'
+./risedev sslt -- --kill-meta --etcd-timeout-rate=0.01 './e2e_test_originalù/path/to/directory/**/*.slt'
 
 # see more usages
 ./risedev sslt -- --help

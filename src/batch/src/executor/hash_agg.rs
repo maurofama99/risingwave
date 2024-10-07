@@ -226,6 +226,7 @@ impl<K: HashKey + Send + Sync> HashAggExecutor<K> {
             let chunk = StreamChunk::from(chunk?);
             let keys = K::build_many(self.group_key_columns.as_slice(), &chunk);
             let mut memory_usage_diff = 0;
+            let mut counter = 0;
             for (row_id, (key, visible)) in keys
                 .into_iter()
                 .zip_eq_fast(chunk.visibility().iter())
@@ -234,8 +235,15 @@ impl<K: HashKey + Send + Sync> HashAggExecutor<K> {
                 if !visible {
                     continue;
                 }
+
+                let content_start = std::time::Instant::now();
+                let entry = groups.entry(key);
+                let content_time = content_start.elapsed();
+                println!("MICROBENCH:CONTENT:{:.2?}", content_time);
+                counter = counter + 1;
+
                 let mut new_group = false;
-                let states = groups.entry(key).or_insert_with(|| {
+                let states = entry.or_insert_with(|| {
                     new_group = true;
                     self.aggs.iter().map(|agg| agg.create_state()).collect()
                 });
@@ -249,6 +257,7 @@ impl<K: HashKey + Send + Sync> HashAggExecutor<K> {
                     memory_usage_diff += state.estimated_size() as i64;
                 }
             }
+            // println!("MICROBENCH:DEBUG | content counter: {}", counter);
             // update memory usage
             if !self.mem_context.add(memory_usage_diff) {
                 Err(BatchError::OutOfMemory(self.mem_context.mem_limit()))?;

@@ -75,7 +75,7 @@ pub fn date_trunc_timestamptz_at_timezone(
             // When unit < day, follow PostgreSQL to use old timezone offset.
             // rather than reinterpret it in the timezone.
             // https://github.com/postgres/postgres/blob/REL_16_0/src/backend/utils/adt/timestamp.c#L4270
-            // See `e2e_test/batch/functions/issue_12072.slt.part` for the difference.
+            // See `e2e_test_originalù/batch/functions/issue_12072.slt.part` for the difference.
             let fixed = instant_local.offset().fix();
             // `unwrap` is okay because `FixedOffset` always returns single unique conversion result.
             let truncated_local = truncated_naive.0.and_local_timezone(fixed).unwrap();

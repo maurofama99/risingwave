@@ -1,0 +1,17 @@
+[cargo-make] INFO - cargo make 0.37.12
+[cargo-make] INFO - Build File: Makefile.toml
+[cargo-make] INFO - Task: configure-if-not-configured
+[cargo-make] INFO - Profile: development
+[cargo-make] INFO - Skipping Task: configure-if-not-configured 
+[cargo-make] INFO - Build Done in 0.14 seconds.
+[cargo-make] INFO - cargo make 0.37.12
+[cargo-make] INFO - Build File: Makefile.toml
+[cargo-make] INFO - Task: slt-streaming
+[cargo-make] INFO - Profile: development
+[cargo-make] INFO - Running Task: check-risedev-env-file
+[cargo-make] INFO - Execute Command: "/usr/bin/env" "bash" "/tmp/fsio_J9HAjifVLG.sh"
+[cargo-make] INFO - Execute Command: "sqllogictest" "./e2e_test/streaming/**/*.slt"
+e2e_test/streaming/1_setup.slt                               .. [OK] in 442 ms
+e2e_test/streaming/5_50.slt                                  .. [OK] in 3637 ms
+e2e_test/streaming/cleanup.slt                               .. [OK] in 192 ms
+[cargo-make] INFO - Build Done in 4.49 seconds.

@@ -140,10 +140,14 @@ impl SortAggExecutor {
 
             for range in groups.ranges() {
                 self.shutdown_rx.check()?;
+
+                let content_start = std::time::Instant::now();
                 let group: Vec<_> = group_columns
                     .iter()
                     .map(|col| col.datum_at(range.start))
                     .collect();
+                let content_time = content_start.elapsed();
+                println!("MICROBENCH:QUERY:{:.2?}", content_time);
 
                 if curr_group.as_ref() != Some(&group) {
                     if let Some(group) = curr_group.replace(group) {

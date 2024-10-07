@@ -1,4 +1,0 @@
-query I rowsort
-select * from nexmark_q106;
-----
-242

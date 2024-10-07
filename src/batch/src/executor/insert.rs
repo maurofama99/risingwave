@@ -187,6 +187,7 @@ impl InsertExecutor {
         if let Some(chunk) = builder.consume_all() {
             let chunk = write_txn_data(chunk).await?;
             rows_inserted += chunk.cardinality();
+            // println!("MICROBENCH:INSERT | {} rows inserted", rows_inserted);
             if self.returning {
                 yield chunk;
             }

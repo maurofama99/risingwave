@@ -9,7 +9,7 @@ RUN apt-get update \
 RUN add-apt-repository ppa:deadsnakes/ppa -y && \
     apt-get update -yy && \
     DEBIAN_FRONTEND=noninteractive apt-get install python3.12 python3.12-dev -yy
-ENV PYO3_PYTHON=python3.12
+ENV PYO3_PYTHON=python3.7
 
 
 FROM base AS dashboard-builder

@@ -52,7 +52,7 @@ CREATE table demo_bhv_table(v1 int primary key,v2 smallint,v3 bigint,v4 float,v5
 
 echo "--- testing sinks"
 cd ../../
-sqllogictest -p 4566 -d dev './e2e_test/sink/cassandra_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/cassandra_sink.slt'
 sleep 1
 cd apache-cassandra-4.1.3/bin
 ./cqlsh -e "COPY demo.demo_bhv_table TO './query_result.csv' WITH HEADER = false AND ENCODING = 'UTF-8';"

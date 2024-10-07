@@ -32,7 +32,7 @@ fn string_to_array_inner<'a>(s: &'a str, sep: Option<&'a str>) -> impl Iterator<
     }
 }
 
-// Use cases shown in `e2e_test/batch/functions/string_to_array.slt.part`
+// Use cases shown in `e2e_test_originalù/batch/functions/string_to_array.slt.part`
 #[function("string_to_array(varchar, varchar) -> varchar[]")]
 pub fn string_to_array2(s: &str, sep: Option<&str>) -> ListValue {
     ListValue::new(string_to_array_inner(s, sep).collect::<Utf8Array>().into())

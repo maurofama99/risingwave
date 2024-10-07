@@ -16,7 +16,7 @@ RUN apt-get update -yy && \
     maven zstd libzstd-dev locales \
     python3.12 python3.12-dev \
     && rm -rf /var/lib/{apt,dpkg,cache,log}/
-ENV PYO3_PYTHON=python3.12
+ENV PYO3_PYTHON=python3.7
 
 # Install nvm and zx
 ENV NVM_DIR /root/.nvm

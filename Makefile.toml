@@ -1326,6 +1326,12 @@ extend = "slt"
 args = ["${@}", "./e2e_test/streaming/**/*.slt"]
 description = "Run all streaming e2e tests"
 
+[tasks.slt-ooo]
+category = "RiseDev - Test - SQLLogicTest"
+extend = "slt"
+args = ["${@}", "./e2e_test/outoforder/**/*.slt"]
+description = "Run all out of order e2e tests"
+
 [tasks.slt-batch]
 category = "RiseDev - Test - SQLLogicTest"
 extend = "slt"

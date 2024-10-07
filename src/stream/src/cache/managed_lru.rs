@@ -94,7 +94,10 @@ impl<K: Hash + Eq + EstimateSize, V: EstimateSize, S: BuildHasher, A: Clone + Al
 
     /// Evict epochs lower than the watermark
     pub fn evict(&mut self) {
+        let evict_start = std::time::Instant::now();
         self.evict_by_epoch(self.load_cur_epoch());
+        let evict_time = evict_start.elapsed();
+        // println!("MICROBENCH:EVICT:{:.2?}", evict_time);
     }
 
     /// Evict epochs lower than the watermark, except those entry which touched in this epoch
@@ -105,9 +108,13 @@ impl<K: Hash + Eq + EstimateSize, V: EstimateSize, S: BuildHasher, A: Clone + Al
 
     /// Evict epochs lower than the watermark
     fn evict_by_epoch(&mut self, epoch: u64) {
+        // println!("evict_by_epoch");
         while let Some((key, value, _)) = self.inner.pop_lru_by_epoch(epoch) {
             let charge = key.estimated_size() + value.estimated_size();
+            let evict_start = std::time::Instant::now();
             self.kv_heap_size_dec(charge);
+            let evict_time = evict_start.elapsed();
+            println!("MICROBENCH:EVICT:{:.2?}", evict_time);
         }
         self.report_evicted_watermark_time(epoch);
     }

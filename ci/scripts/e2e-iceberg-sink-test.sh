@@ -52,7 +52,7 @@ spark-3.3.1-bin-hadoop3/bin/spark-sql --packages $DEPENDENCIES \
     --S --e "CREATE TABLE demo.demo_db.e2e_demo_table(v1 int, v2 bigint, v3 string) TBLPROPERTIES ('format-version'='2');"
 
 echo "--- testing sinks"
-sqllogictest -p 4566 -d dev './e2e_test/sink/iceberg_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/iceberg_sink.slt'
 sleep 1
 
 # check sink destination iceberg

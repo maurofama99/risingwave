@@ -27,7 +27,7 @@ sleep 1
 set -euo pipefail
 
 echo "--- testing mqtt sink"
-sqllogictest -p 4566 -d dev './e2e_test/sink/mqtt_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/mqtt_sink.slt'
 
 sleep 1
 

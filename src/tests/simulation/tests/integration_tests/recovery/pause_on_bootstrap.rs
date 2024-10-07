@@ -146,7 +146,7 @@ async fn test_pause_on_bootstrap_resume_by_restart() -> Result<()> {
     test_impl(ResumeBy::Restart).await
 }
 
-// The idea is similar to `e2e_test/batch/transaction/now.slt`.
+// The idea is similar to `e2e_test_originalù/batch/transaction/now.slt`.
 async fn test_temporal_filter(resume_by: ResumeBy) -> Result<()> {
     const CREATE_TABLE: &str = "create table t (ts timestamp)";
     const CREATE_TEMPORAL_FILTER: &str =

@@ -34,7 +34,7 @@ sleep 2
 ./clickhouse client --host=clickhouse-server --port=9000 --query="CREATE table demo_test(v1 Int32,v2 Int64,v3 String,v4 Enum16('A'=1,'B'=2), v5 decimal64(3))ENGINE = ReplacingMergeTree PRIMARY KEY (v1);"
 
 echo "--- testing sinks"
-sqllogictest -p 4566 -d dev './e2e_test/sink/clickhouse_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/clickhouse_sink.slt'
 sleep 5
 ./clickhouse client --host=clickhouse-server --port=9000 --query="select * from demo_test FORMAT CSV;" > ./query_result.csv
 

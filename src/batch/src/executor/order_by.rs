@@ -107,6 +107,7 @@ impl SortExecutor {
             );
         }
 
+        // println!("MICROBENCH:SORT | ORDER BY, vec size: {})", encoded_rows.len());
         encoded_rows.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
 
         for (row, _) in encoded_rows {

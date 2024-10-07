@@ -29,7 +29,7 @@ apt-get update -y && apt-get install -y redis-server
 sleep 1
 
 echo "--- testing sinks"
-sqllogictest -p 4566 -d dev './e2e_test/sink/redis_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/redis_sink.slt'
 sleep 1
 
 redis-cli -h redis-server -p 6379 get {\"v1\":1} >> ./query_result.txt
@@ -51,7 +51,7 @@ redis-server ./ci/redis-conf/redis-7002.conf --daemonize yes
 
 echo "yes" | redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002
 
-sqllogictest -p 4566 -d dev './e2e_test/sink/redis_cluster_sink.slt'
+sqllogictest -p 4566 -d dev './e2e_test_originalù/sink/redis_cluster_sink.slt'
 
 redis-cli -c --cluster call 127.0.0.1:7000 keys \* >> ./query_result_1.txt
 

@@ -82,7 +82,7 @@ fn main() -> Result<()> {
         .init();
 
     // output directory
-    let slt_dir = PathBuf::from("e2e_test/generated/docslt");
+    let slt_dir = PathBuf::from("../../../../e2e_test_originalù/generated/docslt");
     fs_err::remove_dir_all(&slt_dir).ok();
     fs_err::create_dir_all(&slt_dir)?;
 

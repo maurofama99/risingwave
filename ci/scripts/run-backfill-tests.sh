@@ -19,7 +19,7 @@ set -euo pipefail
 
 PARENT_PATH=$(dirname "${BASH_SOURCE[0]}")
 
-TEST_DIR=$PWD/e2e_test
+TEST_DIR=$PWD/e2e_test_originalù
 BACKGROUND_DDL_DIR=$TEST_DIR/background_ddl
 COMMON_DIR=$BACKGROUND_DDL_DIR/common
 
@@ -183,7 +183,7 @@ test_sink_backfill_recovery() {
   risedev ci-start $CLUSTER_PROFILE
 
   # Check progress
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/sink/create_sink.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/sink/create_sink.slt'
 
   # Restart
   restart_cluster
@@ -200,22 +200,22 @@ test_sink_backfill_recovery() {
   sleep 10
 
   # Verify data matches upstream table.
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/sink/validate_sink.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/sink/validate_sink.slt'
   kill_cluster
 }
 
 test_arrangement_backfill_snapshot_and_upstream_runtime() {
   echo "--- e2e, test_arrangement_backfill_snapshot_and_upstream_runtime, $RUNTIME_CLUSTER_PROFILE"
   risedev ci-start $RUNTIME_CLUSTER_PROFILE
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_table.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_snapshot.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_upstream.slt' 2>&1 1>out.log &
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_table.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_snapshot.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_upstream.slt' 2>&1 1>out.log &
   echo "[INFO] Upstream is ingesting in background"
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_arrangement_backfill_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_arrangement_backfill_mv.slt'
 
   wait
 
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_arrangement.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_arrangement.slt'
 
   risedev ci-kill
 }
@@ -223,15 +223,15 @@ test_arrangement_backfill_snapshot_and_upstream_runtime() {
 test_no_shuffle_backfill_snapshot_and_upstream_runtime() {
   echo "--- e2e, test_no_shuffle_backfill_snapshot_and_upstream_runtime, $RUNTIME_CLUSTER_PROFILE"
   risedev ci-start $RUNTIME_CLUSTER_PROFILE
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_table.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_snapshot.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_upstream.slt' 2>&1 1>out.log &
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_table.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_snapshot.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_upstream.slt' 2>&1 1>out.log &
   echo "[INFO] Upstream is ingesting in background"
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_no_shuffle_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_no_shuffle_mv.slt'
 
   wait
 
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_no_shuffle.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_no_shuffle.slt'
 
   kill_cluster
 }
@@ -239,12 +239,12 @@ test_no_shuffle_backfill_snapshot_and_upstream_runtime() {
 test_backfill_snapshot_runtime() {
   echo "--- e2e, test_backfill_snapshot_runtime, $RUNTIME_CLUSTER_PROFILE"
   risedev ci-start $RUNTIME_CLUSTER_PROFILE
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_table.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_snapshot.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_arrangement_backfill_mv.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_no_shuffle_mv.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_no_shuffle.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_arrangement.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_table.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_snapshot.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_arrangement_backfill_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_no_shuffle_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_no_shuffle.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_arrangement.slt'
 
   kill_cluster
 }
@@ -254,12 +254,12 @@ test_backfill_snapshot_runtime() {
 test_backfill_snapshot_with_limited_storage_throughput() {
   echo "--- e2e, test_backfill_snapshot_with_limited_storage_throughput, $MINIO_RATE_LIMIT_CLUSTER_PROFILE"
   risedev ci-start $MINIO_RATE_LIMIT_CLUSTER_PROFILE
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_table.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_snapshot.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_arrangement_backfill_mv.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_no_shuffle_mv.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_no_shuffle.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_arrangement.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_table.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_snapshot.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_arrangement_backfill_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_no_shuffle_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_no_shuffle.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_arrangement.slt'
 
   kill_cluster
 }
@@ -268,12 +268,12 @@ test_backfill_snapshot_with_limited_storage_throughput() {
 test_backfill_snapshot_with_wider_rows() {
   echo "--- e2e, test_backfill_snapshot_with_wider_rows, $RUNTIME_CLUSTER_PROFILE"
   risedev ci-start $RUNTIME_CLUSTER_PROFILE
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_wide_table.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/insert_wide_snapshot.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_arrangement_backfill_mv.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/create_no_shuffle_mv.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_no_shuffle.slt'
-  sqllogictest -p 4566 -d dev 'e2e_test/backfill/runtime/validate_rows_arrangement.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_wide_table.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/insert_wide_snapshot.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_arrangement_backfill_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/create_no_shuffle_mv.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_no_shuffle.slt'
+  sqllogictest -p 4566 -d dev 'e2e_test_originalù/backfill/runtime/validate_rows_arrangement.slt'
 
   kill_cluster
 }
