@@ -178,7 +178,9 @@ impl<S: StateStore, SD: ValueRowSerde> MaterializeExecutor<S, SD> {
         #[for_await]
         for msg in input {
             let msg = msg?;
+            // let evict_start = std::time::Instant::now();
             self.materialize_cache.evict();
+            // println!("MICROBENCH:EVICT:{:.2?}", evict_start.elapsed());
 
             yield match msg {
                 Message::Watermark(w) => Message::Watermark(w),
@@ -767,6 +769,7 @@ impl<SD: ValueRowSerde> MaterializeCache<SD> {
     }
 
     fn evict(&mut self) {
+        //println!("evict materialize.rs");
         self.data.evict()
     }
 }

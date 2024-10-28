@@ -654,6 +654,7 @@ impl<S: StateStore> OverWindowExecutor<S> {
                     this.state_table.try_flush().await?;
                 }
                 Message::Barrier(barrier) => {
+                    println!("evict general.rs");
                     this.state_table.commit(barrier.epoch).await?;
                     vars.cached_partitions.evict();
 

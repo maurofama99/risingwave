@@ -39,7 +39,7 @@ where
     inner: LruCache<K, V, S, A>,
 
     /// The entry with sequence less than `watermark_sequence` should be evicted.
-    /// `watermark_sequence` should only be updatd by `MemoryManager`.
+    /// `watermark_sequence` should only be updated by `MemoryManager`.
     watermark_sequence: Arc<AtomicSequence>,
 
     // Metrics info
@@ -85,11 +85,13 @@ where
 
     /// Evict epochs lower than the watermark
     pub fn evict(&mut self) {
+        let evict_start = std::time::Instant::now();
         let sequence = self.watermark_sequence.load(Ordering::Relaxed);
         while let Some((key, value, _)) = self.inner.pop_with_sequence(sequence) {
             let charge = key.estimated_size() + value.estimated_size();
             self.reporter.dec(charge);
         }
+        println!("MICROBENCH:EVICT:{:.2?}", evict_start.elapsed());
     }
 
     pub fn put(&mut self, k: K, v: V) -> Option<V> {

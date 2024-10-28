@@ -63,6 +63,7 @@ impl LookupCache {
     }
 
     pub fn evict(&mut self) {
+        println!("evict cache.rs");
         self.data.evict()
     }
 

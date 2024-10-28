@@ -127,8 +127,8 @@ impl HopWindowExecutor {
                     // Collect each window's data into a chunk.
                     let mut chunks = Vec::with_capacity(units);
 
+                    let scope_start = std::time::Instant::now();
                     for i in 0..units {
-                        let scope_start = std::time::Instant::now();
                         let window_start_col = if out_window_start_col_idx.is_some() {
                             Some(
                                 self.window_start_exprs[i]
@@ -159,9 +159,8 @@ impl HopWindowExecutor {
                             .collect();
 
                         chunks.push(DataChunk::new(new_cols, len));
-                        println!("MICROBENCH:DEBUG-SCOPE|len:{:.2?}", len);
-                        println!("MICROBENCH:ADD_S:{:.2?}", scope_start.elapsed());
                     }
+                    // println!("MICROBENCH:SCOPE:{:.2?}", scope_start.elapsed());
 
                     // Reorganize the output rows from the same input row together.
                     let mut row_iters = chunks.iter().map(|c| c.rows()).collect_vec();
@@ -176,19 +175,16 @@ impl HopWindowExecutor {
                             Op::Insert | Op::UpdateInsert => Op::Insert,
                             Op::Delete | Op::UpdateDelete => Op::Delete,
                         };
-                        println!(
-                            "MICROBENCH:DEBUG-ADD|row_iters size:{:.2?}",
-                            row_iters.len()
-                        );
+                        let add_start = std::time::Instant::now();
                         for row_iter in &mut row_iters {
-                            let add_start = std::time::Instant::now();
+
                             if let Some(chunk) =
                                 chunk_builder.append_row(op, row_iter.next().unwrap())
                             {
                                 yield Message::Chunk(chunk);
                             }
-                            println!("MICROBENCH:ADD:{:.2?}", add_start.elapsed());
                         }
+                        println!("MICROBENCH:ADD:{:.2?}", add_start.elapsed());
                     }
 
                     if let Some(chunk) = chunk_builder.take() {

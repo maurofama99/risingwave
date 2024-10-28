@@ -366,6 +366,7 @@ impl<S: StateStore> EowcOverWindowExecutor<S> {
                     this.state_table.try_flush().await?;
                 }
                 Message::Barrier(barrier) => {
+                    println!("evict eowc");
                     this.state_table.commit(barrier.epoch).await?;
                     vars.partitions.evict();
 

@@ -496,7 +496,9 @@ impl<K: HashKey, S: StateStore> HashAggExecutor<K, S> {
         vars.distinct_dedup.flush(&mut this.distinct_dedup_tables)?;
 
         // Evict cache to target capacity.
+        // let evict_start = std::time::Instant::now();
         vars.agg_group_cache.evict();
+        // println!("MICROBENCH:EVICT:{:.2?}", evict_start.elapsed());
     }
 
     fn flush_metrics(_this: &ExecutorInner<K, S>, vars: &mut ExecutionVars<K, S>) {
@@ -602,6 +604,8 @@ impl<K: HashKey, S: StateStore> HashAggExecutor<K, S> {
         #[for_await]
         for msg in input {
             let msg = msg?;
+
+            // println!("evict hash_agg.rs");
             vars.agg_group_cache.evict();
             match msg {
                 Message::Watermark(watermark) => {
